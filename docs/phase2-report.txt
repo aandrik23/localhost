@@ -1,0 +1,65 @@
+Phase 2 Report — Networking Foundation
+
+1. Files changed
+All new:
+
+Cargo.toml — added libc = "0.2"
+src/lib.rs — exposes net/server modules for tests
+src/main.rs — Phase 2 stub entry point (binds two fixed ports, runs the loop)
+src/net/mod.rs, src/net/epoll.rs, src/net/listener.rs, src/net/io.rs
+src/server/mod.rs, src/server/connection.rs, src/server/event_loop.rs
+tests/networking_foundation.rs
+
+2. Architecture implemented
+
+net/epoll.rs — the only file calling epoll_create1/epoll_ctl/epoll_wait.
+
+net/listener.rs — socket/bind/listen/accept, sets O_NONBLOCK on every listener and every accepted client.
+
+net/io.rs — the only file calling read/write; each function does exactly one syscall, no internal loop.
+
+server/connection.rs — Connection struct: read_buf, write_buf + write_offset, ConnState { Reading, Writing, Closing }.
+
+server/event_loop.rs — EventLoop owns the one Epoll, the listener map, and the connection map; tick() does one epoll_wait and dispatches each ready fd to at most one accept/read/write.
+
+3. Tests performed
+
+cargo check — clean, zero warnings.
+
+cargo test — 14/14 passing: 7 unit tests (net::io, net::epoll — EAGAIN behavior, single-syscall read/write, register/deregister roundtrip, event delivery, wait timeout) + 7 integration tests (multi-client accept, disconnect cleanup, 20x connect/disconnect cycles, partial-read accumulation, broken-neighbor isolation, multi-listener sharing one loop).
+
+Manual runtime checks against the built binary using /proc/<pid>/fd:
+    Baseline: 2 listener sockets + 1 epoll fd = 3 fds.
+    5 simultaneous clients → 8 fds; after disconnect → back to 3 fds exactly.
+    50 sequential connect/disconnect cycles → fd count returned to 3, no leak.
+    A neighbor connection force-reset via SO_LINGER(0) (RST) did not affect a second, healthy connection or crash the server process.
+
+Source inspection: grep confirms libc::read/recv appears exactly once in the codebase, libc::write/send exactly once, libc::accept exactly once — all inside net/io.rs/net/listener.rs. The only two loop{} sites are Epoll::wait's EINTR retry (around the multiplexer call, not client I/O) and EventLoop::run's outer forever-loop (the event loop itself). handle_client_readable/handle_client_writable are each invoked at most once per fd per tick() iteration, with no wrapping loop.
+
+4. How each invariant is satisfied
+
+Exactly one epoll instance — EventLoop holds a single Epoll, created once in EventLoop::new.
+
+Exactly one server thread — no std::thread::spawn anywhere in the codebase; main calls run() directly on the main thread.
+
+Exactly one central event loop — EventLoop::run/tick is the only polling loop; verified by grep.
+
+All sockets non-blocking — set_nonblocking applied in bind_listener and again after every accept_one.
+
+Reads only after readable events — handle_client_readable is only reachable from tick()'s dispatch on ev.readable.
+
+Writes only after writable events — handle_client_writable is only reachable from tick()'s dispatch on ev.writable, checked before the readable branch (and continues, so a fd is never both read and written in the same dispatch). 7/8. At most one read/write per client per event — read_once/write_once each contain exactly one raw syscall with no loop; each handler calls its respective _once function exactly once.
+
+Partial I/O represented in state — Connection::read_buf accumulates across reads; write_offset tracks how much of write_buf has been sent, advanced (not reset) on partial writes.
+
+Fatal errors remove the client — every error branch (Err from read/write, ReadOutcome::Closed, EPOLLERR/EPOLLHUP) funnels through the single remove_connection function, which deregisters from epoll, closes the fd, and drops the Connection.
+
+No blocking network I/O — all sockets are non-blocking by construction; no blocking syscalls appear in the event-loop path.
+
+One client cannot terminate the server — errors are scoped to remove_connection(fd) for that one fd only; verified empirically with the SO_LINGER(0) RST test against a healthy sibling connection.
+
+5. Remaining concerns / notes for Phase 3+
+- handle_client_readable currently just accumulates bytes into read_buf with no consumer — expected, since HTTP parsing is out of scope for this phase.
+- No idle/read timeout exists yet (Phase 10 per the roadmap) — a client that connects and sends nothing will sit in Reading indefinitely; not a violation of this phase's invariants, but worth flagging so it isn't forgotten.
+- EventLoop::queue_response exists as a plumbing point for later phases but is currently unused by any handler — fine for now, #[allow(dead_code)] wasn't needed since cargo check didn't flag it (it's pub).
+- Signal handling for EINTR is exercised structurally (matched in both io.rs and epoll.rs) but not integration-tested with an actual delivered signal, since reliably inducing EINTR in a test harness is nontrivial; considered acceptable given the code path is a simple, obviously-correct match arm.
