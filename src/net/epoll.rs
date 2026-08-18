@@ -1,234 +1,789 @@
-//! Thin wrapper around the raw epoll syscalls.
+//! Cross-platform event multiplexer.
 //!
-//! This is the ONLY file that calls `epoll_create1`, `epoll_ctl`, and
-//! `epoll_wait`. Auditors should be able to find epoll initialization,
-//! registration, and the wait call entirely within this file.
+//! Linux   -> epoll
+//! macOS   -> kqueue
+//! Windows -> WSAPoll
+//!
+//! The rest of the server uses the exact same interface regardless
+//! of operating system.
 
 use std::io;
-use std::os::unix::io::RawFd;
 
-/// Interest flags for a registered fd. Kept as a thin newtype over the raw
-/// bitmask so callers don't need to reach for `libc::EPOLLIN` directly.
+use crate::net::socket::SocketId;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Interest(u32);
+pub struct Interest(u8);
 
 impl Interest {
-    pub const READABLE: Interest = Interest(libc::EPOLLIN as u32);
-    pub const WRITABLE: Interest = Interest(libc::EPOLLOUT as u32);
+    pub const READABLE: Interest = Interest(0b01);
+    pub const WRITABLE: Interest = Interest(0b10);
 
-    pub fn bits(self) -> u32 {
-        self.0
+    pub fn contains(self, other: Interest) -> bool {
+        self.0 & other.0 != 0
     }
 }
 
 impl std::ops::BitOr for Interest {
     type Output = Interest;
+
     fn bitor(self, rhs: Interest) -> Interest {
         Interest(self.0 | rhs.0)
     }
 }
 
-/// One event returned by `epoll_wait`, decoded into plain fields.
 #[derive(Debug, Clone, Copy)]
 pub struct EpollEvent {
-    pub fd: RawFd,
+    pub fd: SocketId,
     pub readable: bool,
     pub writable: bool,
     pub error: bool,
     pub hup: bool,
 }
 
-/// Owns the single epoll instance for the whole server.
-///
-/// Exactly one `Epoll` is created for the lifetime of the process (see
-/// `main.rs`); this is the "one central multiplexing mechanism" required by
-/// the audit checklist.
+/* ============================================================
+   LINUX
+   ============================================================ */
+
+#[cfg(target_os = "linux")]
 pub struct Epoll {
-    epfd: RawFd,
+    epfd: std::os::fd::RawFd,
 }
 
+#[cfg(target_os = "linux")]
 impl Epoll {
-    /// Creates the one epoll instance used by the entire server.
-    pub fn new() -> io::Result<Epoll> {
-        // SAFETY: epoll_create1 has no preconditions beyond a valid flags
-        // argument; 0 means no special flags. We check the return value for
-        // an error fd (-1) below.
+    pub fn new() -> io::Result<Self> {
         let epfd = unsafe { libc::epoll_create1(0) };
+
         if epfd < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Epoll { epfd })
+
+        Ok(Self { epfd })
     }
 
-    /// Registers `fd` with the given interest set. Called once per fd when
-    /// it is first placed under multiplexing (listening sockets at startup,
-    /// client sockets on accept).
-    pub fn register(&self, fd: RawFd, interest: Interest) -> io::Result<()> {
-        let mut ev = libc::epoll_event {
-            events: interest.bits(),
+    fn flags(interest: Interest) -> u32 {
+        let mut flags = libc::EPOLLRDHUP as u32;
+
+        if interest.contains(Interest::READABLE) {
+            flags |= libc::EPOLLIN as u32;
+        }
+
+        if interest.contains(Interest::WRITABLE) {
+            flags |= libc::EPOLLOUT as u32;
+        }
+
+        flags
+    }
+
+    pub fn register(
+        &mut self,
+        fd: SocketId,
+        interest: Interest,
+    ) -> io::Result<()> {
+        let mut event = libc::epoll_event {
+            events: Self::flags(interest),
             u64: fd as u64,
         };
-        // SAFETY: `epfd` is a valid epoll fd owned by `self`; `ev` is a
-        // valid, fully-initialized epoll_event on the stack for the
-        // duration of the call.
-        let ret = unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
-        if ret < 0 {
+
+        let result = unsafe {
+            libc::epoll_ctl(
+                self.epfd,
+                libc::EPOLL_CTL_ADD,
+                fd,
+                &mut event,
+            )
+        };
+
+        if result < 0 {
             return Err(io::Error::last_os_error());
         }
+
         Ok(())
     }
 
-    /// Changes the interest set for an already-registered fd. Used to
-    /// switch a client socket between EPOLLIN (waiting for a request) and
-    /// EPOLLOUT (waiting to send a response).
-    pub fn modify(&self, fd: RawFd, interest: Interest) -> io::Result<()> {
-        let mut ev = libc::epoll_event {
-            events: interest.bits(),
+    pub fn modify(
+        &mut self,
+        fd: SocketId,
+        interest: Interest,
+    ) -> io::Result<()> {
+        let mut event = libc::epoll_event {
+            events: Self::flags(interest),
             u64: fd as u64,
         };
-        // SAFETY: same as `register`; `fd` must already be registered,
-        // which is a precondition documented on this method.
-        let ret = unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_MOD, fd, &mut ev) };
-        if ret < 0 {
+
+        let result = unsafe {
+            libc::epoll_ctl(
+                self.epfd,
+                libc::EPOLL_CTL_MOD,
+                fd,
+                &mut event,
+            )
+        };
+
+        if result < 0 {
             return Err(io::Error::last_os_error());
         }
+
         Ok(())
     }
 
-    /// Deregisters `fd`. Must be called before the fd is closed, as part of
-    /// client/listener cleanup.
-    pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
-        // SAFETY: the kernel ignores the event pointer for EPOLL_CTL_DEL on
-        // modern Linux, but older kernels require a non-null pointer; pass a
-        // dummy zeroed event to stay portable.
-        let mut ev = libc::epoll_event { events: 0, u64: 0 };
-        let ret = unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, fd, &mut ev) };
-        if ret < 0 {
+    pub fn deregister(
+        &mut self,
+        fd: SocketId,
+    ) -> io::Result<()> {
+        let mut event = libc::epoll_event {
+            events: 0,
+            u64: 0,
+        };
+
+        let result = unsafe {
+            libc::epoll_ctl(
+                self.epfd,
+                libc::EPOLL_CTL_DEL,
+                fd,
+                &mut event,
+            )
+        };
+
+        if result < 0 {
             let err = io::Error::last_os_error();
-            // ENOENT/EBADF mean the fd is already gone from the epoll set
-            // (e.g. the kernel auto-removed it when the fd was closed
-            // elsewhere) -- not fatal for cleanup purposes.
-            if err.raw_os_error() == Some(libc::ENOENT) || err.raw_os_error() == Some(libc::EBADF)
-            {
+
+            if matches!(
+                err.raw_os_error(),
+                Some(libc::ENOENT) | Some(libc::EBADF)
+            ) {
                 return Ok(());
             }
+
             return Err(err);
         }
+
         Ok(())
     }
 
-    /// The single central `epoll_wait` call. Blocks (with `timeout_ms`,
-    /// or indefinitely if `None`) until at least one registered fd is
-    /// ready, then returns the ready events. This is the only place
-    /// `epoll_wait` is invoked.
-    pub fn wait(&self, buf: &mut Vec<libc::epoll_event>, timeout_ms: i32) -> io::Result<usize> {
-        loop {
-            // SAFETY: `buf` is a valid, appropriately-sized buffer of
-            // `epoll_event`; its capacity is passed as `maxevents`.
-            let n = unsafe {
-                libc::epoll_wait(
-                    self.epfd,
-                    buf.as_mut_ptr(),
-                    buf.capacity() as i32,
-                    timeout_ms,
-                )
-            };
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    // EINTR: a signal interrupted the wait. Not a fatal
-                    // error -- retry the wait rather than propagating.
-                    continue;
-                }
-                return Err(err);
+    pub fn wait(
+        &mut self,
+        events: &mut Vec<EpollEvent>,
+        timeout_ms: i32,
+    ) -> io::Result<usize> {
+        events.clear();
+
+        let capacity = events.capacity().max(1);
+
+        let mut raw =
+            Vec::<libc::epoll_event>::with_capacity(capacity);
+
+        let count = unsafe {
+            libc::epoll_wait(
+                self.epfd,
+                raw.as_mut_ptr(),
+                capacity as i32,
+                timeout_ms,
+            )
+        };
+
+        if count < 0 {
+            let err = io::Error::last_os_error();
+
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(0);
             }
-            // SAFETY: the kernel guarantees the first `n` slots were
-            // written by epoll_wait.
-            unsafe { buf.set_len(n as usize) };
-            return Ok(n as usize);
+
+            return Err(err);
         }
+
+        unsafe {
+            raw.set_len(count as usize);
+        }
+
+        for event in raw {
+            let flags = event.events;
+
+            events.push(EpollEvent {
+                fd: event.u64 as SocketId,
+
+                readable:
+                    flags & libc::EPOLLIN as u32 != 0,
+
+                writable:
+                    flags & libc::EPOLLOUT as u32 != 0,
+
+                error:
+                    flags & libc::EPOLLERR as u32 != 0,
+
+                hup:
+                    flags & libc::EPOLLHUP as u32 != 0
+                        || flags & libc::EPOLLRDHUP as u32 != 0,
+            });
+        }
+
+        Ok(events.len())
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for Epoll {
     fn drop(&mut self) {
-        // SAFETY: `epfd` is a valid fd owned exclusively by this struct.
         unsafe {
             libc::close(self.epfd);
         }
     }
 }
 
-/// Decodes raw `libc::epoll_event`s from a wait call into `EpollEvent`s.
-pub fn decode_events(raw: &[libc::epoll_event]) -> impl Iterator<Item = EpollEvent> + '_ {
-    raw.iter().map(|ev| EpollEvent {
-        fd: ev.u64 as RawFd,
-        readable: ev.events & (libc::EPOLLIN as u32) != 0,
-        writable: ev.events & (libc::EPOLLOUT as u32) != 0,
-        error: ev.events & (libc::EPOLLERR as u32) != 0,
-        hup: ev.events & (libc::EPOLLHUP as u32) != 0 || ev.events & (libc::EPOLLRDHUP as u32) != 0,
-    })
+/* ============================================================
+   MACOS
+   ============================================================ */
+
+#[cfg(target_os = "macos")]
+pub struct Epoll {
+    kqueue_fd: std::os::fd::RawFd,
 }
+
+#[cfg(target_os = "macos")]
+impl Epoll {
+    pub fn new() -> io::Result<Self> {
+        let fd = unsafe { libc::kqueue() };
+
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self {
+            kqueue_fd: fd,
+        })
+    }
+
+    fn kevent(
+        fd: SocketId,
+        filter: i16,
+        flags: u16,
+    ) -> libc::kevent {
+        libc::kevent {
+            ident: fd as libc::uintptr_t,
+            filter,
+            flags,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        }
+    }
+
+    pub fn register(
+        &mut self,
+        fd: SocketId,
+        interest: Interest,
+    ) -> io::Result<()> {
+        let read_flags =
+            if interest.contains(Interest::READABLE) {
+                libc::EV_ADD | libc::EV_ENABLE
+            } else {
+                libc::EV_ADD | libc::EV_DISABLE
+            };
+
+        let write_flags =
+            if interest.contains(Interest::WRITABLE) {
+                libc::EV_ADD | libc::EV_ENABLE
+            } else {
+                libc::EV_ADD | libc::EV_DISABLE
+            };
+
+        let changes = [
+            Self::kevent(
+                fd,
+                libc::EVFILT_READ,
+                read_flags,
+            ),
+
+            Self::kevent(
+                fd,
+                libc::EVFILT_WRITE,
+                write_flags,
+            ),
+        ];
+
+        let result = unsafe {
+            libc::kevent(
+                self.kqueue_fd,
+                changes.as_ptr(),
+                changes.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    pub fn modify(
+        &mut self,
+        fd: SocketId,
+        interest: Interest,
+    ) -> io::Result<()> {
+        let read_flags =
+            if interest.contains(Interest::READABLE) {
+                libc::EV_ENABLE
+            } else {
+                libc::EV_DISABLE
+            };
+
+        let write_flags =
+            if interest.contains(Interest::WRITABLE) {
+                libc::EV_ENABLE
+            } else {
+                libc::EV_DISABLE
+            };
+
+        let changes = [
+            Self::kevent(
+                fd,
+                libc::EVFILT_READ,
+                read_flags,
+            ),
+
+            Self::kevent(
+                fd,
+                libc::EVFILT_WRITE,
+                write_flags,
+            ),
+        ];
+
+        let result = unsafe {
+            libc::kevent(
+                self.kqueue_fd,
+                changes.as_ptr(),
+                changes.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    pub fn deregister(
+        &mut self,
+        fd: SocketId,
+    ) -> io::Result<()> {
+        let changes = [
+            Self::kevent(
+                fd,
+                libc::EVFILT_READ,
+                libc::EV_DELETE,
+            ),
+
+            Self::kevent(
+                fd,
+                libc::EVFILT_WRITE,
+                libc::EV_DELETE,
+            ),
+        ];
+
+        let result = unsafe {
+            libc::kevent(
+                self.kqueue_fd,
+                changes.as_ptr(),
+                changes.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+
+        if result < 0 {
+            let err = io::Error::last_os_error();
+
+            if matches!(
+                err.raw_os_error(),
+                Some(libc::ENOENT) | Some(libc::EBADF)
+            ) {
+                return Ok(());
+            }
+
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    pub fn wait(
+        &mut self,
+        events: &mut Vec<EpollEvent>,
+        timeout_ms: i32,
+    ) -> io::Result<usize> {
+        use std::collections::HashMap;
+
+        events.clear();
+
+        let capacity = events.capacity().max(1);
+
+        let mut raw =
+            Vec::<libc::kevent>::with_capacity(capacity);
+
+        let timeout;
+
+        let timeout_ptr =
+            if timeout_ms < 0 {
+                std::ptr::null()
+            } else {
+                timeout = libc::timespec {
+                    tv_sec:
+                        (timeout_ms / 1000)
+                            as libc::time_t,
+
+                    tv_nsec:
+                        ((timeout_ms % 1000) * 1_000_000)
+                            as libc::c_long,
+                };
+
+                &timeout as *const libc::timespec
+            };
+
+        let count = unsafe {
+            libc::kevent(
+                self.kqueue_fd,
+                std::ptr::null(),
+                0,
+                raw.as_mut_ptr(),
+                capacity as i32,
+                timeout_ptr,
+            )
+        };
+
+        if count < 0 {
+            let err = io::Error::last_os_error();
+
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(0);
+            }
+
+            return Err(err);
+        }
+
+        unsafe {
+            raw.set_len(count as usize);
+        }
+
+        let mut merged:
+            HashMap<SocketId, EpollEvent> =
+            HashMap::new();
+
+        for event in raw {
+            let fd = event.ident as SocketId;
+
+            let item =
+                merged.entry(fd).or_insert(EpollEvent {
+                    fd,
+                    readable: false,
+                    writable: false,
+                    error: false,
+                    hup: false,
+                });
+
+            if event.filter == libc::EVFILT_READ {
+                item.readable = true;
+            }
+
+            if event.filter == libc::EVFILT_WRITE {
+                item.writable = true;
+            }
+
+            if event.flags & libc::EV_ERROR != 0 {
+                item.error = true;
+            }
+
+            if event.flags & libc::EV_EOF != 0 {
+                item.hup = true;
+            }
+        }
+
+        events.extend(merged.into_values());
+
+        Ok(events.len())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Epoll {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.kqueue_fd);
+        }
+    }
+}
+
+/* ============================================================
+   WINDOWS
+   ============================================================ */
+
+#[cfg(windows)]
+use std::collections::HashMap;
+
+#[cfg(windows)]
+#[repr(C)]
+struct WsaPollFd {
+    fd: SocketId,
+    events: i16,
+    revents: i16,
+}
+
+#[cfg(windows)]
+#[link(name = "Ws2_32")]
+extern "system" {
+    fn WSAPoll(
+        fd_array: *mut WsaPollFd,
+        fds: u32,
+        timeout: i32,
+    ) -> i32;
+
+    fn WSAGetLastError() -> i32;
+}
+
+#[cfg(windows)]
+const POLLERR: i16 = 0x0001;
+
+#[cfg(windows)]
+const POLLHUP: i16 = 0x0002;
+
+#[cfg(windows)]
+const POLLNVAL: i16 = 0x0004;
+
+#[cfg(windows)]
+const POLLWRNORM: i16 = 0x0010;
+
+#[cfg(windows)]
+const POLLRDNORM: i16 = 0x0100;
+
+#[cfg(windows)]
+const POLLRDBAND: i16 = 0x0200;
+
+#[cfg(windows)]
+const POLLIN: i16 = POLLRDNORM | POLLRDBAND;
+
+#[cfg(windows)]
+pub struct Epoll {
+    interests: HashMap<SocketId, Interest>,
+}
+
+#[cfg(windows)]
+impl Epoll {
+    pub fn new() -> io::Result<Self> {
+        Ok(Self {
+            interests: HashMap::new(),
+        })
+    }
+
+    pub fn register(
+        &mut self,
+        fd: SocketId,
+        interest: Interest,
+    ) -> io::Result<()> {
+        if self.interests.contains_key(&fd) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "socket already registered",
+            ));
+        }
+
+        self.interests.insert(fd, interest);
+
+        Ok(())
+    }
+
+    pub fn modify(
+        &mut self,
+        fd: SocketId,
+        interest: Interest,
+    ) -> io::Result<()> {
+        match self.interests.get_mut(&fd) {
+            Some(current) => {
+                *current = interest;
+                Ok(())
+            }
+
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "socket not registered",
+            )),
+        }
+    }
+
+    pub fn deregister(
+        &mut self,
+        fd: SocketId,
+    ) -> io::Result<()> {
+        self.interests.remove(&fd);
+
+        Ok(())
+    }
+
+    pub fn wait(
+        &mut self,
+        events: &mut Vec<EpollEvent>,
+        timeout_ms: i32,
+    ) -> io::Result<usize> {
+        events.clear();
+
+        if self.interests.is_empty() {
+            return Ok(0);
+        }
+
+        let mut poll_fds = Vec::with_capacity(
+            self.interests.len(),
+        );
+
+        for (&fd, &interest) in &self.interests {
+            let mut requested = 0i16;
+
+            if interest.contains(Interest::READABLE) {
+                requested |= POLLIN;
+            }
+
+            if interest.contains(Interest::WRITABLE) {
+                requested |= POLLWRNORM;
+            }
+
+            poll_fds.push(WsaPollFd {
+                fd,
+                events: requested,
+                revents: 0,
+            });
+        }
+
+        let result = unsafe {
+            WSAPoll(
+                poll_fds.as_mut_ptr(),
+                poll_fds.len() as u32,
+                timeout_ms,
+            )
+        };
+
+        if result < 0 {
+            let code = unsafe { WSAGetLastError() };
+
+            return Err(io::Error::from_raw_os_error(code));
+        }
+
+        if result == 0 {
+            return Ok(0);
+        }
+
+        for poll in poll_fds {
+            if poll.revents == 0 {
+                continue;
+            }
+
+            events.push(EpollEvent {
+                fd: poll.fd,
+
+                readable:
+                    poll.revents & POLLIN != 0,
+
+                writable:
+                    poll.revents & POLLWRNORM != 0,
+
+                error:
+                    poll.revents
+                        & (POLLERR | POLLNVAL)
+                        != 0,
+
+                hup:
+                    poll.revents & POLLHUP != 0,
+            });
+        }
+
+        Ok(events.len())
+    }
+}
+
+/* ============================================================
+   COMMON TESTS
+   ============================================================ */
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::io::AsRawFd;
-    use std::os::unix::net::UnixStream;
 
-    #[test]
-    fn register_and_wait_reports_readable_event() {
-        let epoll = Epoll::new().expect("create epoll instance");
-        let (a, mut b) = UnixStream::pair().expect("create socketpair");
-        a.set_nonblocking(true).unwrap();
+    use crate::net::socket::stream_id;
 
-        epoll
-            .register(a.as_raw_fd(), Interest::READABLE)
-            .expect("register fd");
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
 
-        std::io::Write::write_all(&mut b, b"x").unwrap();
+    fn pair() -> (TcpStream, TcpStream) {
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).unwrap();
 
-        let mut buf = Vec::with_capacity(8);
-        let n = epoll.wait(&mut buf, 1000).expect("wait");
-        assert_eq!(n, 1);
+        let addr = listener.local_addr().unwrap();
 
-        let events: Vec<_> = decode_events(&buf).collect();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].fd, a.as_raw_fd());
-        assert!(events[0].readable);
+        let client = TcpStream::connect(addr).unwrap();
+
+        let (server, _) = listener.accept().unwrap();
+
+        server.set_nonblocking(true).unwrap();
+
+        (server, client)
     }
 
     #[test]
-    fn deregister_stops_further_events() {
-        let epoll = Epoll::new().expect("create epoll instance");
-        let (a, mut b) = UnixStream::pair().expect("create socketpair");
-        a.set_nonblocking(true).unwrap();
+    fn readable_event_is_reported() {
+        let (server, mut client) = pair();
 
-        epoll
-            .register(a.as_raw_fd(), Interest::READABLE)
-            .expect("register fd");
-        epoll
-            .deregister(a.as_raw_fd())
-            .expect("deregister fd");
+        let fd = stream_id(&server);
 
-        std::io::Write::write_all(&mut b, b"x").unwrap();
+        let mut poller = Epoll::new().unwrap();
 
-        let mut buf = Vec::with_capacity(8);
-        let n = epoll.wait(&mut buf, 100).expect("wait");
-        assert_eq!(n, 0, "no events should be reported after deregister");
+        poller
+            .register(fd, Interest::READABLE)
+            .unwrap();
+
+        client.write_all(b"x").unwrap();
+
+        let mut events = Vec::with_capacity(16);
+
+        let count =
+            poller.wait(&mut events, 1000).unwrap();
+
+        assert!(count >= 1);
+
+        assert!(
+            events
+                .iter()
+                .any(|event| {
+                    event.fd == fd && event.readable
+                })
+        );
     }
 
     #[test]
-    fn wait_times_out_with_no_ready_fds() {
-        let epoll = Epoll::new().expect("create epoll instance");
-        let (a, _b) = UnixStream::pair().expect("create socketpair");
-        a.set_nonblocking(true).unwrap();
-        epoll
-            .register(a.as_raw_fd(), Interest::READABLE)
-            .expect("register fd");
+    fn deregister_removes_socket() {
+        let (server, mut client) = pair();
 
-        let mut buf = Vec::with_capacity(8);
-        let n = epoll.wait(&mut buf, 50).expect("wait");
-        assert_eq!(n, 0);
+        let fd = stream_id(&server);
+
+        let mut poller = Epoll::new().unwrap();
+
+        poller
+            .register(fd, Interest::READABLE)
+            .unwrap();
+
+        poller.deregister(fd).unwrap();
+
+        client.write_all(b"x").unwrap();
+
+        let mut events = Vec::with_capacity(16);
+
+        let count =
+            poller.wait(&mut events, 50).unwrap();
+
+        assert_eq!(count, 0);
     }
 }

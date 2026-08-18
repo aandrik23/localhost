@@ -19,19 +19,10 @@ fn start_loop_on_ephemeral_port() -> (EventLoop, u16) {
 
 /// Reads back the port the OS assigned when binding to port 0, via
 /// getsockname on the raw fd.
-fn local_port_of(listener: &localhost::net::listener::Listener) -> u16 {
-    use std::mem;
-    let mut addr: libc::sockaddr_in = unsafe { mem::zeroed() };
-    let mut len = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    let ret = unsafe {
-        libc::getsockname(
-            listener.fd,
-            &mut addr as *mut libc::sockaddr_in as *mut libc::sockaddr,
-            &mut len,
-        )
-    };
-    assert_eq!(ret, 0, "getsockname failed");
-    u16::from_be(addr.sin_port)
+fn local_port_of(
+    listener: &localhost::net::listener::Listener,
+) -> u16 {
+    listener.port
 }
 
 /// Drives `tick` until `pred(&event_loop)` is true or `max_ticks` elapses.
@@ -133,6 +124,7 @@ fn one_broken_client_does_not_affect_others() {
 
     // Abruptly reset the "bad" connection by setting SO_LINGER(0) and
     // dropping it, which causes the kernel to send RST instead of FIN.
+    #[cfg(unix)]
     set_linger_zero(&bad);
     drop(bad);
 
@@ -148,6 +140,7 @@ fn one_broken_client_does_not_affect_others() {
     assert_eq!(event_loop.connection_count(), 1);
 }
 
+#[cfg(unix)]
 fn set_linger_zero(stream: &TcpStream) {
     use std::os::unix::io::AsRawFd;
     let linger = libc::linger {
