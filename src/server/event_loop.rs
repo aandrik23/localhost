@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 use std::io;
 
+use crate::http::{
+    parse_request,
+    ParseResult,
+};
+
 use crate::net::epoll::{
     Epoll,
     EpollEvent,
@@ -200,6 +205,8 @@ impl EventLoop {
 
         match outcome {
             Ok(ReadOutcome::Read(count)) => {
+                let mut parse_failed = false;
+
                 if let Some(connection) =
                     self.connections.get_mut(&id)
                 {
@@ -210,6 +217,73 @@ impl EventLoop {
                         );
 
                     connection.touch();
+
+                    /*
+                    * One network read may contain:
+                    *
+                    * - part of one HTTP request
+                    * - exactly one request
+                    * - multiple requests
+                    *
+                    * Parsing multiple already-buffered requests does NOT
+                    * violate the "one read per event" rule because no
+                    * additional socket read happens here.
+                    */
+                    loop {
+                        match parse_request(
+                            &connection.read_buf,
+                        ) {
+                            Ok(
+                                ParseResult::Complete {
+                                    value,
+                                    consumed,
+                                }
+                            ) => {
+                                connection
+                                    .requests
+                                    .push_back(value);
+
+                                /*
+                                * Remove only the bytes belonging to the
+                                * completed request.
+                                *
+                                * Any bytes after it may belong to another
+                                * HTTP/1.1 request.
+                                */
+                                connection
+                                    .read_buf
+                                    .drain(..consumed);
+                            }
+
+                            Ok(ParseResult::Incomplete) => {
+                                break;
+                            }
+
+                            Err(err) => {
+                                eprintln!(
+                                    "invalid HTTP request from {}:{}: {}",
+                                    connection.peer_addr,
+                                    connection.peer_port,
+                                    err
+                                );
+
+                                /*
+                                * Phase 5 will convert this into an HTTP
+                                * 400 response.
+                                *
+                                * For Phase 4 we simply close malformed
+                                * connections safely.
+                                */
+                                parse_failed = true;
+
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if parse_failed {
+                    self.remove_connection(id);
                 }
             }
 

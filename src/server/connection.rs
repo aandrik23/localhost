@@ -1,9 +1,21 @@
+use std::collections::VecDeque;
 use std::net::{Ipv4Addr, TcpStream};
 use std::time::Instant;
 
-use crate::net::socket::{stream_id, SocketId};
+use crate::http::HttpRequest;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+use crate::net::socket::{
+    stream_id,
+    SocketId,
+};
+
+#[derive(
+    Debug,
+    PartialEq,
+    Eq,
+    Clone,
+    Copy,
+)]
 pub enum ConnState {
     Reading,
     Writing,
@@ -20,9 +32,22 @@ pub struct Connection {
 
     pub state: ConnState,
 
+    /*
+     * Raw bytes that have arrived from the network but have
+     * not yet formed a complete HTTP request.
+     */
     pub read_buf: Vec<u8>,
 
+    /*
+     * Complete HTTP requests waiting to be handled.
+     *
+     * VecDeque is useful because HTTP/1.1 may deliver more
+     * than one request on the same connection.
+     */
+    pub requests: VecDeque<HttpRequest>,
+
     pub write_buf: Vec<u8>,
+
     pub write_offset: usize,
 
     pub last_activity: Instant,
@@ -34,41 +59,68 @@ impl Connection {
         peer_addr: Ipv4Addr,
         peer_port: u16,
     ) -> Self {
-        let id = stream_id(&socket);
+        let id =
+            stream_id(&socket);
 
         Self {
             id,
+
             socket,
 
             peer_addr,
             peer_port,
 
-            state: ConnState::Reading,
+            state:
+                ConnState::Reading,
 
-            read_buf: Vec::new(),
+            read_buf:
+                Vec::new(),
 
-            write_buf: Vec::new(),
-            write_offset: 0,
+            requests:
+                VecDeque::new(),
 
-            last_activity: Instant::now(),
+            write_buf:
+                Vec::new(),
+
+            write_offset:
+                0,
+
+            last_activity:
+                Instant::now(),
         }
     }
 
-    pub fn pending_write(&self) -> &[u8] {
-        &self.write_buf[self.write_offset..]
+    pub fn pending_write(
+        &self,
+    ) -> &[u8] {
+        &self.write_buf[
+            self.write_offset..
+        ]
     }
 
-    pub fn write_complete(&self) -> bool {
-        self.write_offset >= self.write_buf.len()
+    pub fn write_complete(
+        &self,
+    ) -> bool {
+        self.write_offset
+            >= self.write_buf.len()
     }
 
-    pub fn queue_write(&mut self, data: Vec<u8>) {
+    pub fn queue_write(
+        &mut self,
+        data: Vec<u8>,
+    ) {
         self.write_buf = data;
+
         self.write_offset = 0;
-        self.state = ConnState::Writing;
+
+        self.state =
+            ConnState::Writing;
     }
 
-    pub fn touch(&mut self) {
-        self.last_activity = Instant::now();
+    pub fn touch(
+        &mut self,
+    ) {
+        self.last_activity =
+            Instant::now();
     }
 }
