@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::io;
 
+use crate::config::Config;
+
 use crate::http::{
     parse_request,
     ParseResult,
@@ -32,25 +34,38 @@ use crate::server::connection::{
     Connection,
 };
 
+use crate::server::http_handler::{
+    bad_request_response,
+    handle_request,
+};
+
 const READ_CHUNK: usize = 16 * 1024;
 
 pub struct EventLoop {
     epoll: Epoll,
 
-    listeners: HashMap<SocketId, Listener>,
+    listeners:
+        HashMap<SocketId, Listener>,
 
-    connections: HashMap<SocketId, Connection>,
+    connections:
+        HashMap<SocketId, Connection>,
 
-    events_buf: Vec<EpollEvent>,
+    events_buf:
+        Vec<EpollEvent>,
+
+    config: Config,
 }
 
 impl EventLoop {
     pub fn new(
         listeners: Vec<Listener>,
+        config: Config,
     ) -> io::Result<Self> {
-        let mut epoll = Epoll::new()?;
+        let mut epoll =
+            Epoll::new()?;
 
-        let mut listener_map = HashMap::new();
+        let mut listener_map =
+            HashMap::new();
 
         for listener in listeners {
             epoll.register(
@@ -67,23 +82,34 @@ impl EventLoop {
         Ok(Self {
             epoll,
 
-            listeners: listener_map,
+            listeners:
+                listener_map,
 
-            connections: HashMap::new(),
+            connections:
+                HashMap::new(),
 
-            events_buf: Vec::with_capacity(1024),
+            events_buf:
+                Vec::with_capacity(1024),
+
+            config,
         })
     }
 
-    pub fn listener_count(&self) -> usize {
+    pub fn listener_count(
+        &self,
+    ) -> usize {
         self.listeners.len()
     }
 
-    pub fn connection_count(&self) -> usize {
+    pub fn connection_count(
+        &self,
+    ) -> usize {
         self.connections.len()
     }
 
-    pub fn run(&mut self) -> io::Result<()> {
+    pub fn run(
+        &mut self,
+    ) -> io::Result<()> {
         loop {
             self.tick(-1)?;
         }
@@ -99,35 +125,66 @@ impl EventLoop {
                 timeout_ms,
             )?;
 
-        let events = self.events_buf.clone();
+        let events =
+            self.events_buf.clone();
 
         for event in events {
-            if self.listeners.contains_key(&event.fd) {
-                self.handle_listener_event(event.fd);
+            if self
+                .listeners
+                .contains_key(
+                    &event.fd
+                )
+            {
+                self.handle_listener_event(
+                    event.fd
+                );
+
                 continue;
             }
 
-            if !self.connections.contains_key(&event.fd) {
+            if !self
+                .connections
+                .contains_key(
+                    &event.fd
+                )
+            {
                 continue;
             }
 
             if event.error {
-                self.remove_connection(event.fd);
+                self.remove_connection(
+                    event.fd
+                );
+
                 continue;
             }
 
+            /*
+             * Perform at most one socket write for this event.
+             */
             if event.writable {
-                self.handle_client_writable(event.fd);
+                self.handle_client_writable(
+                    event.fd
+                );
+
                 continue;
             }
 
+            /*
+             * Perform at most one socket read for this event.
+             */
             if event.readable {
-                self.handle_client_readable(event.fd);
+                self.handle_client_readable(
+                    event.fd
+                );
+
                 continue;
             }
 
             if event.hup {
-                self.remove_connection(event.fd);
+                self.remove_connection(
+                    event.fd
+                );
             }
         }
 
@@ -140,19 +197,32 @@ impl EventLoop {
     ) {
         let result = {
             let listener =
-                match self.listeners.get(&listener_id) {
-                    Some(listener) => listener,
-                    None => return,
+                match self
+                    .listeners
+                    .get(&listener_id)
+                {
+                    Some(listener) => {
+                        listener
+                    }
+
+                    None => {
+                        return;
+                    }
                 };
 
+            /*
+             * Exactly one accept attempt.
+             */
             accept_one(listener)
         };
 
         match result {
-            Ok(AcceptResult::Accepted {
-                stream,
-                peer,
-            }) => {
+            Ok(
+                AcceptResult::Accepted {
+                    stream,
+                    peer,
+                }
+            ) => {
                 let connection =
                     Connection::new(
                         stream,
@@ -160,11 +230,15 @@ impl EventLoop {
                         peer.1,
                     );
 
-                let id = connection.id;
+                let id =
+                    connection.id;
 
                 if self
                     .epoll
-                    .register(id, Interest::READABLE)
+                    .register(
+                        id,
+                        Interest::READABLE,
+                    )
                     .is_err()
                 {
                     return;
@@ -176,11 +250,20 @@ impl EventLoop {
                 );
             }
 
-            Ok(AcceptResult::WouldBlock) => {}
+            Ok(
+                AcceptResult::WouldBlock
+            ) => {}
 
-            Ok(AcceptResult::Interrupted) => {}
+            Ok(
+                AcceptResult::Interrupted
+            ) => {}
 
-            Err(_) => {}
+            Err(err) => {
+                eprintln!(
+                    "accept error: {}",
+                    err
+                );
+            }
         }
     }
 
@@ -188,15 +271,25 @@ impl EventLoop {
         &mut self,
         id: SocketId,
     ) {
-        let mut chunk = [0u8; READ_CHUNK];
+        let mut chunk =
+            [0u8; READ_CHUNK];
 
         let outcome = {
             let connection =
-                match self.connections.get_mut(&id) {
-                    Some(connection) => connection,
+                match self
+                    .connections
+                    .get_mut(&id)
+                {
+                    Some(connection) => {
+                        connection
+                    }
+
                     None => return,
                 };
 
+            /*
+             * ONE read only.
+             */
             read_once(
                 &mut connection.socket,
                 &mut chunk,
@@ -204,11 +297,16 @@ impl EventLoop {
         };
 
         match outcome {
-            Ok(ReadOutcome::Read(count)) => {
-                let mut parse_failed = false;
+            Ok(
+                ReadOutcome::Read(count)
+            ) => {
+                let mut parse_failed =
+                    false;
 
                 if let Some(connection) =
-                    self.connections.get_mut(&id)
+                    self
+                        .connections
+                        .get_mut(&id)
                 {
                     connection
                         .read_buf
@@ -219,16 +317,11 @@ impl EventLoop {
                     connection.touch();
 
                     /*
-                    * One network read may contain:
-                    *
-                    * - part of one HTTP request
-                    * - exactly one request
-                    * - multiple requests
-                    *
-                    * Parsing multiple already-buffered requests does NOT
-                    * violate the "one read per event" rule because no
-                    * additional socket read happens here.
-                    */
+                     * We may parse multiple HTTP requests from
+                     * already buffered bytes.
+                     *
+                     * This does NOT perform another socket read.
+                     */
                     loop {
                         match parse_request(
                             &connection.read_buf,
@@ -241,40 +334,37 @@ impl EventLoop {
                             ) => {
                                 connection
                                     .requests
-                                    .push_back(value);
+                                    .push_back(
+                                        value
+                                    );
 
-                                /*
-                                * Remove only the bytes belonging to the
-                                * completed request.
-                                *
-                                * Any bytes after it may belong to another
-                                * HTTP/1.1 request.
-                                */
                                 connection
                                     .read_buf
-                                    .drain(..consumed);
+                                    .drain(
+                                        ..consumed
+                                    );
                             }
 
-                            Ok(ParseResult::Incomplete) => {
+                            Ok(
+                                ParseResult::Incomplete
+                            ) => {
                                 break;
                             }
 
                             Err(err) => {
                                 eprintln!(
-                                    "invalid HTTP request from {}:{}: {}",
+                                    "bad request from {}:{}: {}",
                                     connection.peer_addr,
                                     connection.peer_port,
                                     err
                                 );
 
-                                /*
-                                * Phase 5 will convert this into an HTTP
-                                * 400 response.
-                                *
-                                * For Phase 4 we simply close malformed
-                                * connections safely.
-                                */
-                                parse_failed = true;
+                                parse_failed =
+                                    true;
+
+                                connection
+                                    .read_buf
+                                    .clear();
 
                                 break;
                             }
@@ -282,21 +372,136 @@ impl EventLoop {
                     }
                 }
 
+                /*
+                 * Remove parsed requests from the connection
+                 * before handling them so we don't keep a mutable
+                 * borrow of self.connections.
+                 */
+                let mut requests =
+                    Vec::new();
+
+                if let Some(connection) =
+                    self
+                        .connections
+                        .get_mut(&id)
+                {
+                    while let Some(request) =
+                        connection
+                            .requests
+                            .pop_front()
+                    {
+                        requests.push(
+                            request
+                        );
+                    }
+                }
+
+                /*
+                 * Convert every complete request into an HTTP
+                 * response.
+                 */
+                for request in requests {
+                    let response =
+                        handle_request(
+                            &self.config,
+                            &request,
+                        );
+
+                    let bytes =
+                        response.to_bytes();
+
+                    if let Some(connection) =
+                        self
+                            .connections
+                            .get_mut(&id)
+                    {
+                        connection
+                            .queue_write(
+                                bytes
+                            );
+                    }
+                }
+
+                /*
+                 * Malformed HTTP gets a real 400 response now
+                 * instead of silently dropping the connection.
+                 */
                 if parse_failed {
-                    self.remove_connection(id);
+                    let response =
+                        bad_request_response(
+                            &self.config
+                        );
+
+                    let bytes =
+                        response.to_bytes();
+
+                    if let Some(connection) =
+                        self
+                            .connections
+                            .get_mut(&id)
+                    {
+                        connection
+                            .queue_write_and_close(
+                                bytes
+                            );
+                    }
+                }
+
+                /*
+                 * If at least one response was queued,
+                 * wait for socket writability.
+                 */
+                let should_write =
+                    self
+                        .connections
+                        .get(&id)
+                        .map(|connection| {
+                            !connection
+                                .write_complete()
+                        })
+                        .unwrap_or(false);
+
+                if should_write {
+                    if self
+                        .epoll
+                        .modify(
+                            id,
+                            Interest::WRITABLE,
+                        )
+                        .is_err()
+                    {
+                        self.remove_connection(
+                            id
+                        );
+                    }
                 }
             }
 
-            Ok(ReadOutcome::Closed) => {
-                self.remove_connection(id);
+            Ok(
+                ReadOutcome::Closed
+            ) => {
+                self.remove_connection(
+                    id
+                );
             }
 
-            Ok(ReadOutcome::WouldBlock) => {}
+            Ok(
+                ReadOutcome::WouldBlock
+            ) => {}
 
-            Ok(ReadOutcome::Interrupted) => {}
+            Ok(
+                ReadOutcome::Interrupted
+            ) => {}
 
-            Err(_) => {
-                self.remove_connection(id);
+            Err(err) => {
+                eprintln!(
+                    "read error: {}",
+                    err
+                );
+
+                self.remove_connection(
+                    id
+                );
             }
         }
     }
@@ -307,70 +512,129 @@ impl EventLoop {
     ) {
         let outcome = {
             let connection =
-                match self.connections.get_mut(&id) {
-                    Some(connection) => connection,
+                match self
+                    .connections
+                    .get_mut(&id)
+                {
+                    Some(connection) => {
+                        connection
+                    }
+
                     None => return,
                 };
 
-            if connection.write_offset
-                >= connection.write_buf.len()
+            if connection
+                .write_complete()
             {
                 return;
             }
 
-            let offset = connection.write_offset;
+            let offset =
+                connection.write_offset;
 
-            let socket = &mut connection.socket;
+            let socket =
+                &mut connection.socket;
 
             let data =
-                &connection.write_buf[offset..];
+                &connection
+                    .write_buf[offset..];
 
-            write_once(socket, data)
+            /*
+             * ONE write only.
+             */
+            write_once(
+                socket,
+                data,
+            )
         };
 
         match outcome {
-            Ok(WriteOutcome::Written(count)) => {
-                let mut should_remove = false;
+            Ok(
+                WriteOutcome::Written(count)
+            ) => {
+                let mut remove =
+                    false;
+
+                let mut switch_to_read =
+                    false;
 
                 if let Some(connection) =
-                    self.connections.get_mut(&id)
+                    self
+                        .connections
+                        .get_mut(&id)
                 {
-                    connection.write_offset += count;
+                    connection
+                        .write_offset
+                        += count;
 
                     connection.touch();
 
-                    if connection.write_complete() {
-                        connection.state =
-                            ConnState::Reading;
-
-                        connection.write_buf.clear();
-
-                        connection.write_offset = 0;
-
-                        if self
-                            .epoll
-                            .modify(
-                                id,
-                                Interest::READABLE,
-                            )
-                            .is_err()
+                    if connection
+                        .write_complete()
+                    {
+                        if connection
+                            .close_after_write
                         {
-                            should_remove = true;
+                            remove = true;
+                        } else {
+                            connection.state =
+                                ConnState::Reading;
+
+                            connection
+                                .write_buf
+                                .clear();
+
+                            connection
+                                .write_offset =
+                                0;
+
+                            switch_to_read =
+                                true;
                         }
                     }
                 }
 
-                if should_remove {
-                    self.remove_connection(id);
+                if remove {
+                    self.remove_connection(
+                        id
+                    );
+
+                    return;
+                }
+
+                if switch_to_read {
+                    if self
+                        .epoll
+                        .modify(
+                            id,
+                            Interest::READABLE,
+                        )
+                        .is_err()
+                    {
+                        self.remove_connection(
+                            id
+                        );
+                    }
                 }
             }
 
-            Ok(WriteOutcome::WouldBlock) => {}
+            Ok(
+                WriteOutcome::WouldBlock
+            ) => {}
 
-            Ok(WriteOutcome::Interrupted) => {}
+            Ok(
+                WriteOutcome::Interrupted
+            ) => {}
 
-            Err(_) => {
-                self.remove_connection(id);
+            Err(err) => {
+                eprintln!(
+                    "write error: {}",
+                    err
+                );
+
+                self.remove_connection(
+                    id
+                );
             }
         }
     }
@@ -381,9 +645,14 @@ impl EventLoop {
         data: Vec<u8>,
     ) -> io::Result<()> {
         if let Some(connection) =
-            self.connections.get_mut(&id)
+            self
+                .connections
+                .get_mut(&id)
         {
-            connection.queue_write(data);
+            connection
+                .queue_write(
+                    data
+                );
 
             self.epoll.modify(
                 id,
@@ -398,11 +667,15 @@ impl EventLoop {
         &mut self,
         id: SocketId,
     ) {
-        if self.connections.remove(&id).is_some() {
-            let _ = self.epoll.deregister(id);
-
-            // TcpStream is automatically closed here when
-            // Connection is dropped.
+        if self
+            .connections
+            .remove(&id)
+            .is_some()
+        {
+            let _ =
+                self
+                    .epoll
+                    .deregister(id);
         }
     }
 }
@@ -411,24 +684,31 @@ impl Drop for EventLoop {
     fn drop(&mut self) {
         let connections:
             Vec<SocketId> =
-            self.connections
+            self
+                .connections
                 .keys()
                 .copied()
                 .collect();
 
         for id in connections {
-            self.remove_connection(id);
+            self.remove_connection(
+                id
+            );
         }
 
         let listeners:
             Vec<SocketId> =
-            self.listeners
+            self
+                .listeners
                 .keys()
                 .copied()
                 .collect();
 
         for id in listeners {
-            let _ = self.epoll.deregister(id);
+            let _ =
+                self
+                    .epoll
+                    .deregister(id);
         }
 
         self.listeners.clear();

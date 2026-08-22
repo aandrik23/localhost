@@ -102,7 +102,7 @@ fn main() {
     }
 
     let mut event_loop =
-        match EventLoop::new(listeners) {
+        match EventLoop::new(listeners, config,) {
             Ok(event_loop) => event_loop,
 
             Err(err) => {

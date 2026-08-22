@@ -4,16 +4,22 @@
 use std::io::Write;
 use std::net::{Ipv4Addr, TcpStream};
 use std::time::Duration;
+use std::collections::HashMap;
 
 use localhost::net::listener::bind_listener;
 use localhost::server::event_loop::EventLoop;
+use localhost::config::{
+    Config,
+    RouteConfig,
+    ServerConfig,
+};
 
 /// Binds one listener on an OS-assigned ephemeral port and wraps it in an
 /// EventLoop, returning the loop and the bound port.
 fn start_loop_on_ephemeral_port() -> (EventLoop, u16) {
     let listener = bind_listener(Ipv4Addr::LOCALHOST, 0).expect("bind ephemeral listener");
     let port = local_port_of(&listener);
-    let event_loop = EventLoop::new(vec![listener]).expect("create event loop");
+    let event_loop = EventLoop::new(vec![listener], test_config(),).expect("create event loop");
     (event_loop, port)
 }
 
@@ -40,6 +46,64 @@ fn drive_until(
         event_loop.tick(50).expect("tick should not error");
     }
     assert!(pred(event_loop), "condition not met within max_ticks");
+}
+
+fn test_config() -> Config {
+    Config {
+        servers: vec![
+            ServerConfig {
+                server_address:
+                    "127.0.0.1".to_string(),
+
+                ports:
+                    vec![8080],
+
+                server_name:
+                    vec!["localhost".to_string()],
+
+                error_pages:
+                    HashMap::new(),
+
+                client_max_body_size:
+                    1024 * 1024,
+
+                routes:
+                    vec![
+                        RouteConfig {
+                            path:
+                                "/".to_string(),
+
+                            methods:
+                                vec![
+                                    "GET".to_string()
+                                ],
+
+                            root:
+                                Some(
+                                    "./www".to_string()
+                                ),
+
+                            index:
+                                Some(
+                                    "index.html".to_string()
+                                ),
+
+                            directory_listing:
+                                false,
+
+                            redirect:
+                                None,
+
+                            redirect_status:
+                                None,
+
+                            cgi:
+                                HashMap::new(),
+                        }
+                    ],
+            }
+        ],
+    }
 }
 
 #[test]
@@ -186,7 +250,7 @@ fn multiple_listeners_share_one_event_loop() {
     let p1 = local_port_of(&l1);
     let p2 = local_port_of(&l2);
 
-    let mut event_loop = EventLoop::new(vec![l1, l2]).expect("create event loop");
+    let mut event_loop = EventLoop::new(vec![l1, l2], test_config(),).expect("create event loop");
     assert_eq!(event_loop.listener_count(), 2);
 
     let c1 = TcpStream::connect(("127.0.0.1", p1)).expect("connect to listener 1");

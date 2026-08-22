@@ -1,5 +1,8 @@
 use std::collections::VecDeque;
-use std::net::{Ipv4Addr, TcpStream};
+use std::net::{
+    Ipv4Addr,
+    TcpStream,
+};
 use std::time::Instant;
 
 use crate::http::HttpRequest;
@@ -32,23 +35,15 @@ pub struct Connection {
 
     pub state: ConnState,
 
-    /*
-     * Raw bytes that have arrived from the network but have
-     * not yet formed a complete HTTP request.
-     */
     pub read_buf: Vec<u8>,
 
-    /*
-     * Complete HTTP requests waiting to be handled.
-     *
-     * VecDeque is useful because HTTP/1.1 may deliver more
-     * than one request on the same connection.
-     */
     pub requests: VecDeque<HttpRequest>,
 
     pub write_buf: Vec<u8>,
 
     pub write_offset: usize,
+
+    pub close_after_write: bool,
 
     pub last_activity: Instant,
 }
@@ -85,6 +80,9 @@ impl Connection {
             write_offset:
                 0,
 
+            close_after_write:
+                false,
+
             last_activity:
                 Instant::now(),
         }
@@ -105,16 +103,41 @@ impl Connection {
             >= self.write_buf.len()
     }
 
+    /*
+     * Adds bytes to the outgoing buffer.
+     *
+     * If a response is already waiting, append the next
+     * response instead of replacing it.
+     *
+     * This allows basic HTTP/1.1 pipelining.
+     */
     pub fn queue_write(
         &mut self,
         data: Vec<u8>,
     ) {
-        self.write_buf = data;
+        if self.write_complete() {
+            self.write_buf = data;
 
-        self.write_offset = 0;
+            self.write_offset = 0;
+        } else {
+            self.write_buf
+                .extend_from_slice(&data);
+        }
 
         self.state =
             ConnState::Writing;
+    }
+
+    pub fn queue_write_and_close(
+        &mut self,
+        data: Vec<u8>,
+    ) {
+        self.queue_write(data);
+
+        self.close_after_write = true;
+
+        self.state =
+            ConnState::Closing;
     }
 
     pub fn touch(
