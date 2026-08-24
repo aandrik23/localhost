@@ -33,6 +33,9 @@ pub struct Connection {
     pub peer_addr: Ipv4Addr,
     pub peer_port: u16,
 
+    pub local_addr: Ipv4Addr,
+    pub local_port: u16,
+
     pub state: ConnState,
 
     pub read_buf: Vec<u8>,
@@ -53,6 +56,8 @@ impl Connection {
         socket: TcpStream,
         peer_addr: Ipv4Addr,
         peer_port: u16,
+        local_addr: Ipv4Addr,
+        local_port: u16,
     ) -> Self {
         let id =
             stream_id(&socket);
@@ -64,6 +69,9 @@ impl Connection {
 
             peer_addr,
             peer_port,
+
+            local_addr,
+            local_port,
 
             state:
                 ConnState::Reading,

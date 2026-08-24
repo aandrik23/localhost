@@ -18,37 +18,42 @@ use crate::http::{
     StatusCode,
 };
 
+/// Handles a request against an already-selected route.
+///
+/// Route selection (which route matches `request.path`) and virtual
+/// server selection happen before this function is called; see
+/// `server::routing`. This function only enforces the route's allowed
+/// methods, resolves redirects, and serves from the filesystem.
 pub fn handle_static_request(
     request: &HttpRequest,
     server: &ServerConfig,
+    route: &RouteConfig,
 ) -> HttpResponse {
-    if request.method != Method::Get {
+    if !method_allowed(route, &request.method) {
         return error_response(
             server,
             StatusCode::MethodNotAllowed,
         )
         .with_header(
             "Allow",
-            "GET",
+            allow_header_value(route),
         );
     }
 
-    /*
-     * Phase 5 deliberately uses only the root route.
-     *
-     * Full route selection is implemented in Phase 6.
-     */
-    let route =
-        match root_route(server) {
-            Some(route) => route,
+    if let Some(location) = &route.redirect {
+        let status = StatusCode::from_redirect_status(
+            route.redirect_status.unwrap_or(302),
+        );
 
-            None => {
-                return error_response(
-                    server,
-                    StatusCode::InternalServerError,
-                );
-            }
-        };
+        return HttpResponse::new(
+            status,
+            Vec::new(),
+        )
+        .with_header(
+            "Location",
+            location.clone(),
+        );
+    }
 
     let root =
         match &route.root {
@@ -65,6 +70,8 @@ pub fn handle_static_request(
     let relative_path =
         request
             .path
+            .strip_prefix(&route.path)
+            .unwrap_or(&request.path)
             .trim_start_matches('/');
 
     if !is_safe_relative_path(relative_path) {
@@ -304,16 +311,22 @@ pub fn default_error_response(
     )
 }
 
-fn root_route(
-    server: &ServerConfig,
-) -> Option<&RouteConfig> {
-    server
-        .routes
+/// Deny-all default: a route with no configured methods accepts
+/// nothing until methods are explicitly listed.
+fn method_allowed(
+    route: &RouteConfig,
+    method: &Method,
+) -> bool {
+    route
+        .methods
         .iter()
-        .find(|route| {
-            route.path == "/"
-                && route.root.is_some()
-        })
+        .any(|allowed| allowed.as_str() == method.as_str())
+}
+
+fn allow_header_value(
+    route: &RouteConfig,
+) -> String {
+    route.methods.join(", ")
 }
 
 fn is_safe_relative_path(

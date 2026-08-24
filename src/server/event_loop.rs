@@ -195,7 +195,7 @@ impl EventLoop {
         &mut self,
         listener_id: SocketId,
     ) {
-        let result = {
+        let (result, local_addr, local_port) = {
             let listener =
                 match self
                     .listeners
@@ -213,7 +213,11 @@ impl EventLoop {
             /*
              * Exactly one accept attempt.
              */
-            accept_one(listener)
+            (
+                accept_one(listener),
+                listener.addr,
+                listener.port,
+            )
         };
 
         match result {
@@ -228,6 +232,8 @@ impl EventLoop {
                         stream,
                         peer.0,
                         peer.1,
+                        local_addr,
+                        local_port,
                     );
 
                 let id =
@@ -380,11 +386,22 @@ impl EventLoop {
                 let mut requests =
                     Vec::new();
 
+                let mut local_addr =
+                    std::net::Ipv4Addr::UNSPECIFIED;
+
+                let mut local_port = 0;
+
                 if let Some(connection) =
                     self
                         .connections
                         .get_mut(&id)
                 {
+                    local_addr =
+                        connection.local_addr;
+
+                    local_port =
+                        connection.local_port;
+
                     while let Some(request) =
                         connection
                             .requests
@@ -405,6 +422,8 @@ impl EventLoop {
                         handle_request(
                             &self.config,
                             &request,
+                            local_addr,
+                            local_port,
                         );
 
                     let bytes =

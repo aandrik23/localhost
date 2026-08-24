@@ -1,0 +1,156 @@
+Phase 6 Report — Routing and Virtual Hosts
+
+Phase:
+Phase 6 — Routing and Virtual Hosts.
+
+Implemented:
+
+1. Virtual host selection (src/server/routing.rs::select_server).
+   Given (local_addr, local_port, Host header), filters configured
+   servers to those bound to that listener (server_address matches or
+   is 0.0.0.0, and the port is in the server's ports list), then
+   matches the Host header (port suffix stripped, case-insensitive)
+   against each candidate's server_name list. Falls back to the first
+   matching server for that listener if the Host header is absent or
+   matches no server_name, per the spec's "first server is the
+   default" rule.
+
+2. Route selection (src/server/routing.rs::select_route).
+   Longest-prefix match by path segment: a route "/foo" matches
+   "/foo" and "/foo/bar" but not "/foobar" (segment-boundary check).
+   The root route "/" matches everything as the fallback. No regular
+   expressions are used, per spec.
+
+3. Method restriction (src/http/static_files.rs::method_allowed).
+   A route's configured `methods` list is now enforced for every
+   route, not just a hardcoded GET check on the root route. An empty
+   methods list denies all methods (405), per explicit decision this
+   session — routes must opt in to methods rather than defaulting to
+   permissive. 405 responses include an `Allow` header listing the
+   route's configured methods.
+
+4. Redirects (src/http/static_files.rs).
+   A route with `redirect` set now returns a 3xx response with a
+   `Location` header instead of ever touching the filesystem.
+   `redirect_status` (validated as 300-399 in config::validation)
+   selects the specific status; unrecognized codes fall back to 302
+   Found. Added StatusCode variants: MovedPermanently (301), Found
+   (302), SeeOther (303), TemporaryRedirect (307), PermanentRedirect
+   (308), plus StatusCode::from_redirect_status(u16).
+
+5. Listener-aware connections (src/server/connection.rs,
+   src/server/event_loop.rs).
+   Connection now records local_addr/local_port (the listener's own
+   address/port, captured at accept time from the already-known
+   Listener — no new syscall). event_loop.rs passes these through to
+   http_handler::handle_request so virtual-host selection has the
+   (addr, port) half of its key.
+
+6. Request dispatch (src/server/http_handler.rs::handle_request).
+   Now does: Host header extraction -> select_server -> select_route
+   -> handle_static_request(request, server, route). No route match
+   returns 404 (via the matched server's configured error page).
+   handle_static_request's signature changed to take the pre-selected
+   route explicitly, replacing Phase 5's hardcoded root_route() lookup
+   and hardcoded GET-only check.
+
+Files changed:
+- src/server/routing.rs — new file: select_server, select_route,
+  normalize_host, path_matches_route, unit tests.
+- src/server/mod.rs — added `pub mod routing;`.
+- src/server/connection.rs — added local_addr/local_port fields and
+  constructor parameters.
+- src/server/event_loop.rs — captures listener addr/port at accept
+  time; passes local_addr/local_port into handle_request.
+- src/server/http_handler.rs — handle_request now does server+route
+  selection instead of always using config.servers.first().
+- src/http/static_files.rs — handle_static_request takes an explicit
+  &RouteConfig; added method_allowed/allow_header_value; added
+  redirect handling; relative path is now computed relative to the
+  matched route's path (route.path stripped from request.path), not
+  hardcoded to strip a single leading '/'.
+- src/http/response.rs — added redirect StatusCode variants and
+  StatusCode::from_redirect_status.
+- tests/http_response_phase5.rs — updated all handle_static_request
+  call sites to the 3-argument signature (route = &server.routes[0]).
+- tests/routing_phase6.rs — new file, 10 integration tests exercising
+  handle_request end-to-end.
+
+Tests added (tests/routing_phase6.rs):
+- selects_virtual_server_by_host_header
+- unmatched_host_falls_back_to_default_server
+- different_ports_select_different_servers
+- route_with_no_configured_methods_denies_all
+- method_not_allowed_includes_allow_header
+- redirect_route_returns_302_and_location
+- redirect_route_honors_configured_status
+- longest_matching_route_wins_over_root
+- no_matching_route_returns_404
+- select_server_and_select_route_are_directly_usable
+
+Plus 6 unit tests in src/server/routing.rs::tests covering
+select_server/select_route directly (host matching, fallback, port
+suffix stripping, unbound-port rejection, longest-prefix, segment
+boundary).
+
+Tests executed:
+cargo check — clean, zero warnings.
+cargo test — 66/66 passing (14 unit tests, 10 config tests, 16 HTTP
+parser tests, 9 HTTP response/static-file tests, 7 networking tests,
+10 routing tests).
+
+Manual verification against the built binary using config.toml
+(two virtual servers sharing 0.0.0.0:8080/8081, four routes: "/"
+GET-only, "/uploads" GET/POST/DELETE with directory_listing=true,
+"/old" redirect to "/", "/cgi" with a .py mapping):
+- GET / with Host: localhost -> 200, serves www/index.html.
+- GET /old -> 302 Found, Location: /.
+- GET /uploads/ -> 200, generated directory listing (uploads/ was
+  empty, so an empty <ul> — consistent with Phase 5's directory
+  listing behavior).
+- DELETE / -> 405 Method Not Allowed, Allow: GET.
+- GET /nonexistent-route with an unmatched Host header -> falls back
+  to the default server for that listener and returns the server's
+  configured custom 404 page.
+
+Known limitations:
+- CGI routes are recognized by path/route matching but CGI execution
+  itself is not implemented; a request to /cgi/*.py currently falls
+  through to static file handling and will 404 (no such static file)
+  rather than invoking python3. CGI execution is explicitly Phase 9.
+- select_server's address matching only special-cases 0.0.0.0
+  (INADDR_ANY); it does not attempt to match a server configured for
+  a specific non-loopback address against a client connecting via
+  127.0.0.1 or another local interface address. This mirrors how the
+  server actually binds listeners (main.rs binds exactly what
+  server_address specifies), so it isn't a functional gap in
+  practice, but it's worth noting if server_address handling changes.
+- Route matching is a linear scan over server.routes with a max-by
+  longest-path; fine for the expected route-table sizes in this
+  project and keeps the implementation simple/auditable, but would
+  not scale to very large route tables.
+
+Audit requirements satisfied:
+- Virtual host selection via (local address, local port, Host header)
+  with first-server-as-default fallback, matching the spec exactly.
+- Route path matching without regular expressions.
+- 405 Method Not Allowed with an Allow header when a route exists but
+  the method isn't accepted.
+- HTTP redirects configurable per route, with configurable status
+  code.
+- Directory defaults (index file) and directory listing continue to
+  work per-route, now reachable through real route selection instead
+  of a hardcoded root-only path.
+
+Remaining risks:
+- No test yet exercises virtual host selection through the live
+  event loop/socket path with curl --resolve against multiple
+  simultaneous hostnames sharing one listener; this session's manual
+  verification used a single-hostname config.toml. Recommend adding
+  that as part of Phase 11 (Browser Compatibility and Integration
+  Testing) or before final audit.
+- error_response()'s custom-error-page lookup is keyed only by status
+  code and is server-scoped (not route-scoped), which matches the
+  spec ("Path to custom error pages" is a per-server, not per-route,
+  setting) — noted here only because it's easy to assume otherwise
+  once routes are in the picture.

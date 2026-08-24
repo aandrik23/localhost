@@ -160,6 +160,7 @@ fn serves_index_file() {
                 "/",
             ),
             &server,
+            &server.routes[0],
         );
 
     assert_eq!(
@@ -203,6 +204,7 @@ fn serves_static_file() {
                 "/hello.txt",
             ),
             &server,
+            &server.routes[0],
         );
 
     assert_eq!(
@@ -240,6 +242,7 @@ fn missing_file_returns_404() {
                 "/missing.html",
             ),
             &server,
+            &server.routes[0],
         );
 
     assert_eq!(
@@ -278,6 +281,7 @@ fn post_returns_405() {
                 "/",
             ),
             &server,
+            &server.routes[0],
         );
 
     assert_eq!(
@@ -310,6 +314,7 @@ fn traversal_is_forbidden() {
                 "/../secret.txt",
             ),
             &server,
+            &server.routes[0],
         );
 
     assert_eq!(
@@ -342,6 +347,7 @@ fn directory_without_index_is_forbidden_when_listing_disabled() {
                 "/",
             ),
             &server,
+            &server.routes[0],
         );
 
     assert_eq!(
@@ -386,6 +392,7 @@ fn directory_listing_is_served_when_enabled() {
                 "/",
             ),
             &server,
+            &server.routes[0],
         );
 
     assert_eq!(
@@ -442,6 +449,7 @@ fn response_includes_date_header() {
                 "/",
             ),
             &server,
+            &server.routes[0],
         );
 
     let raw =
@@ -493,6 +501,7 @@ fn serialized_response_has_status_and_length() {
                 "/",
             ),
             &server,
+            &server.routes[0],
         );
 
     let raw =

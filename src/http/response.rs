@@ -103,6 +103,11 @@ fn civil_from_days(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusCode {
     Ok,
+    MovedPermanently,
+    Found,
+    SeeOther,
+    TemporaryRedirect,
+    PermanentRedirect,
     BadRequest,
     Forbidden,
     NotFound,
@@ -112,9 +117,28 @@ pub enum StatusCode {
 }
 
 impl StatusCode {
+    /// Maps a validated redirect status (300-399, checked by
+    /// config::validation) to the corresponding StatusCode. Any
+    /// 3xx value not covered by a named variant falls back to 302
+    /// Found, which is a safe generic redirect.
+    pub fn from_redirect_status(code: u16) -> Self {
+        match code {
+            301 => StatusCode::MovedPermanently,
+            303 => StatusCode::SeeOther,
+            307 => StatusCode::TemporaryRedirect,
+            308 => StatusCode::PermanentRedirect,
+            _ => StatusCode::Found,
+        }
+    }
+
     pub fn code(self) -> u16 {
         match self {
             StatusCode::Ok => 200,
+            StatusCode::MovedPermanently => 301,
+            StatusCode::Found => 302,
+            StatusCode::SeeOther => 303,
+            StatusCode::TemporaryRedirect => 307,
+            StatusCode::PermanentRedirect => 308,
             StatusCode::BadRequest => 400,
             StatusCode::Forbidden => 403,
             StatusCode::NotFound => 404,
@@ -127,6 +151,11 @@ impl StatusCode {
     pub fn reason_phrase(self) -> &'static str {
         match self {
             StatusCode::Ok => "OK",
+            StatusCode::MovedPermanently => "Moved Permanently",
+            StatusCode::Found => "Found",
+            StatusCode::SeeOther => "See Other",
+            StatusCode::TemporaryRedirect => "Temporary Redirect",
+            StatusCode::PermanentRedirect => "Permanent Redirect",
             StatusCode::BadRequest => "Bad Request",
             StatusCode::Forbidden => "Forbidden",
             StatusCode::NotFound => "Not Found",

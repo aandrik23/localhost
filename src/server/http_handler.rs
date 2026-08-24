@@ -1,3 +1,5 @@
+use std::net::Ipv4Addr;
+
 use crate::config::Config;
 
 use crate::http::{
@@ -9,24 +11,26 @@ use crate::http::{
     StatusCode,
 };
 
+use crate::server::routing::{
+    select_route,
+    select_server,
+};
+
 pub fn handle_request(
     config: &Config,
     request: &HttpRequest,
+    local_addr: Ipv4Addr,
+    local_port: u16,
 ) -> HttpResponse {
-    /*
-     * Phase 5 uses the first configured server.
-     *
-     * Phase 6 will use:
-     *
-     * - listener address
-     * - listener port
-     * - Host header
-     * - route matching
-     *
-     * to select the correct virtual server.
-     */
+    let host = request.header("Host");
+
     let server =
-        match config.servers.first() {
+        match select_server(
+            config,
+            local_addr,
+            local_port,
+            host,
+        ) {
             Some(server) => server,
 
             None => {
@@ -36,9 +40,22 @@ pub fn handle_request(
             }
         };
 
+    let route =
+        match select_route(server, &request.path) {
+            Some(route) => route,
+
+            None => {
+                return error_response(
+                    server,
+                    StatusCode::NotFound,
+                );
+            }
+        };
+
     handle_static_request(
         request,
         server,
+        route,
     )
 }
 
