@@ -83,19 +83,39 @@ pub fn handle_static_request(
      * GET /
      *
      * points to a directory, use the configured index file.
+     *
+     * If there is no index file, fall back to a generated
+     * directory listing when the route allows it.
      */
+    let mut list_directory = false;
+
     if requested_path.is_dir() {
         match &route.index {
             Some(index) => {
-                requested_path =
+                let index_path =
                     requested_path.join(index);
+
+                if index_path.is_file() {
+                    requested_path = index_path;
+                } else if route.directory_listing {
+                    list_directory = true;
+                } else {
+                    return error_response(
+                        server,
+                        StatusCode::Forbidden,
+                    );
+                }
             }
 
             None => {
-                return error_response(
-                    server,
-                    StatusCode::Forbidden,
-                );
+                if route.directory_listing {
+                    list_directory = true;
+                } else {
+                    return error_response(
+                        server,
+                        StatusCode::Forbidden,
+                    );
+                }
             }
         }
     }
@@ -161,6 +181,20 @@ pub fn handle_static_request(
             server,
             StatusCode::Forbidden,
         );
+    }
+
+    if list_directory {
+        return match render_directory_listing(
+            &canonical_file,
+            &request.path,
+        ) {
+            Ok(response) => response,
+
+            Err(_) => error_response(
+                server,
+                StatusCode::InternalServerError,
+            ),
+        };
     }
 
     if !canonical_file.is_file() {
@@ -317,6 +351,86 @@ fn is_safe_relative_path(
     }
 
     true
+}
+
+fn render_directory_listing(
+    dir: &Path,
+    request_path: &str,
+) -> io::Result<HttpResponse> {
+    let mut entries: Vec<String> =
+        fs::read_dir(dir)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| {
+                let name = entry
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned();
+
+                let is_dir = entry
+                    .file_type()
+                    .map(|ft| ft.is_dir())
+                    .unwrap_or(false);
+
+                if is_dir {
+                    format!("{}/", name)
+                } else {
+                    name
+                }
+            })
+            .collect();
+
+    entries.sort();
+
+    let display_path =
+        if request_path.ends_with('/') {
+            request_path.to_string()
+        } else {
+            format!("{}/", request_path)
+        };
+
+    let mut list_items = String::new();
+
+    for name in &entries {
+        let href = html_escape(name);
+
+        list_items.push_str(&format!(
+            "<li><a href=\"{0}\">{0}</a></li>",
+            href
+        ));
+    }
+
+    let html = format!(
+        "<!DOCTYPE html>\
+<html>\
+<head>\
+<meta charset=\"utf-8\">\
+<title>Index of {0}</title>\
+</head>\
+<body>\
+<h1>Index of {0}</h1>\
+<ul>{1}</ul>\
+<hr>\
+<p>localhost-rust</p>\
+</body>\
+</html>",
+        html_escape(&display_path),
+        list_items,
+    );
+
+    Ok(HttpResponse::html(
+        StatusCode::Ok,
+        html,
+    ))
+}
+
+fn html_escape(
+    input: &str,
+) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn content_type_for_path(

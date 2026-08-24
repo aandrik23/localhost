@@ -1,4 +1,104 @@
 use std::fmt;
+use std::time::{
+    SystemTime,
+    UNIX_EPOCH,
+};
+
+/*
+ * Formats a SystemTime as an RFC 7231 IMF-fixdate, e.g.:
+ *
+ * Sun, 06 Nov 1994 08:49:37 GMT
+ *
+ * Computed with plain civil-calendar arithmetic (Howard Hinnant's
+ * days_from_civil algorithm) since no time/chrono crate is available
+ * and epoll-driven server code should not depend on one.
+ */
+fn http_date(
+    time: SystemTime,
+) -> String {
+    let secs =
+        time.duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+    let days =
+        secs.div_euclid(86_400);
+
+    let day_secs =
+        secs.rem_euclid(86_400);
+
+    let hour = day_secs / 3600;
+    let minute = (day_secs % 3600) / 60;
+    let second = day_secs % 60;
+
+    let weekday =
+        (days.rem_euclid(7) + 4) % 7;
+
+    let weekday_name = [
+        "Sun", "Mon", "Tue", "Wed",
+        "Thu", "Fri", "Sat",
+    ][weekday as usize];
+
+    let (year, month, day) =
+        civil_from_days(days);
+
+    let month_name = [
+        "Jan", "Feb", "Mar", "Apr",
+        "May", "Jun", "Jul", "Aug",
+        "Sep", "Oct", "Nov", "Dec",
+    ][(month - 1) as usize];
+
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        weekday_name,
+        day,
+        month_name,
+        year,
+        hour,
+        minute,
+        second,
+    )
+}
+
+/*
+ * Converts a day count since the Unix epoch (1970-01-01) into a
+ * (year, month, day) civil date. Proleptic Gregorian calendar.
+ */
+fn civil_from_days(
+    z: i64,
+) -> (i64, i64, i64) {
+    let z = z + 719_468;
+
+    let era =
+        if z >= 0 { z } else { z - 146_096 }
+            / 146_097;
+
+    let doe = (z - era * 146_097) as u64;
+
+    let yoe = (doe
+        - doe / 1460
+        + doe / 36524
+        - doe / 146_096)
+        / 365;
+
+    let y = yoe as i64 + era * 400;
+
+    let doy =
+        doe - (365 * yoe + yoe / 4 - yoe / 100);
+
+    let mp = (5 * doy + 2) / 153;
+
+    let d = (doy - (153 * mp + 2) / 5 + 1) as i64;
+
+    let m =
+        if mp < 10 { mp + 3 } else { mp - 9 }
+            as i64;
+
+    let year =
+        if m <= 2 { y + 1 } else { y };
+
+    (year, m, d)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusCode {
@@ -130,6 +230,15 @@ impl HttpResponse {
                 },
             );
 
+        let has_date =
+            self.headers.iter().any(
+                |(name, _)| {
+                    name.eq_ignore_ascii_case(
+                        "date"
+                    )
+                },
+            );
+
         for (name, value) in &self.headers {
             let header = format!(
                 "{}: {}\r\n",
@@ -159,6 +268,17 @@ impl HttpResponse {
             );
         }
 
+        if !has_date {
+            let header = format!(
+                "Date: {}\r\n",
+                http_date(SystemTime::now())
+            );
+
+            response.extend_from_slice(
+                header.as_bytes(),
+            );
+        }
+
         response.extend_from_slice(
             b"\r\n",
         );
@@ -168,5 +288,32 @@ impl HttpResponse {
         );
 
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_date_matches_rfc7231_example() {
+        let time =
+            UNIX_EPOCH
+                + std::time::Duration::from_secs(
+                    784_111_777,
+                );
+
+        assert_eq!(
+            http_date(time),
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+        );
+    }
+
+    #[test]
+    fn http_date_matches_epoch() {
+        assert_eq!(
+            http_date(UNIX_EPOCH),
+            "Thu, 01 Jan 1970 00:00:00 GMT",
+        );
     }
 }

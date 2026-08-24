@@ -1,0 +1,90 @@
+Phase 5 Report — Response Engine and Static File Serving
+
+Phase:
+Phase 5 — Response Engine and Static File Serving.
+
+Implemented:
+Response construction (status line, headers, Content-Length, Server, Date) was
+already implemented in src/http/response.rs prior to this session, along with
+static file serving, path-traversal/symlink-escape protection, error pages,
+and MIME type mapping in src/http/static_files.rs, wired into the event loop
+via src/server/http_handler.rs and src/server/event_loop.rs.
+
+This session closed two gaps found against the Phase 5 spec:
+
+1. Directory listing. The route config already had a `directory_listing`
+   flag (validated in config/validation.rs) but static_files.rs never acted
+   on it — a directory without a usable index file always returned 403.
+   Directory listing is now generated when the flag is enabled: entries are
+   read via fs::read_dir on the already-canonicalized, root-contained path,
+   sorted, HTML-escaped, and rendered as a minimal index page (directories
+   suffixed with `/`). When the flag is disabled, the previous 403 behavior
+   is unchanged.
+
+2. Date response header. HttpResponse::to_bytes() now emits a `Date` header
+   in RFC 7231 IMF-fixdate form (e.g. "Sun, 06 Nov 1994 08:49:37 GMT") unless
+   the caller already set one. The date is computed from SystemTime with
+   pure civil-calendar arithmetic (Howard Hinnant's days_from_civil), since
+   no time/chrono crate is a project dependency and none was added.
+
+Files changed:
+- src/http/response.rs — added http_date()/civil_from_days(), Date header
+  emission, unit tests.
+- src/http/static_files.rs — added list_directory branch, render_directory_listing(),
+  html_escape().
+- tests/http_response_phase5.rs — added directory_without_index_is_forbidden_when_listing_disabled,
+  directory_listing_is_served_when_enabled, response_includes_date_header;
+  added server_with_root_and_listing() test helper.
+
+Tests added:
+- http::response::tests::http_date_matches_rfc7231_example
+- http::response::tests::http_date_matches_epoch
+- directory_without_index_is_forbidden_when_listing_disabled
+- directory_listing_is_served_when_enabled
+- response_includes_date_header
+
+Tests executed:
+cargo check — clean, zero warnings.
+cargo test — 50/50 passing (8 unit tests, 10 config tests, 16 HTTP parser
+tests, 9 HTTP response/static-file tests, 7 networking tests).
+
+Known limitations:
+- handle_static_request still only consults the route whose path is exactly
+  "/" (root_route()); full route matching, multiple routes per server, and
+  virtual-host selection are explicitly deferred to Phase 6, per the spec's
+  own phase boundary ("Phase 5 deliberately uses only the root route").
+- Directory listing does not show file sizes or modification times; the
+  spec only requires the feature to be toggleable and functional, not any
+  particular listing format.
+- CGI mappings in route config are not yet consulted (Phase 9).
+
+Audit requirements satisfied:
+- HTTP response construction: status line, headers, Content-Length,
+  Content-Type, Connection (via existing Connection header handling),
+  Date, Server.
+- Static file serving for files and directories (index file or listing).
+- Configured default/index files.
+- Configured error pages, with a safe built-in fallback when a custom page
+  is missing or unreadable.
+- Path traversal prevented via component-based rejection of `..` plus
+  canonicalization + root-containment check (not string-prefix matching).
+- Symlink escape prevented as a consequence of canonicalization before the
+  root-containment check.
+- MIME type mapping for common extensions with a safe generic fallback
+  (application/octet-stream) for unknown types.
+- Partial writes remain represented via Connection::write_buf/write_offset
+  in the event loop (unchanged in this session); no blocking writes were
+  introduced.
+
+Remaining risks:
+- render_directory_listing() performs a directory read (fs::read_dir) and
+  HTML formatting synchronously inside the request-handling path, same as
+  the existing fs::read for static files. This is consistent with the
+  current architecture (filesystem calls are treated as fast local
+  operations, not proxied through epoll) but should be kept in mind if the
+  project ever needs to handle very large directories or a slow/networked
+  filesystem.
+- No test yet exercises directory listing end-to-end through the live
+  event loop/socket path (only the handler function is tested directly);
+  the existing Phase 5 tests follow the same pattern, so this is consistent
+  with prior coverage rather than a new gap.

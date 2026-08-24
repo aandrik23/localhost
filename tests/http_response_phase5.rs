@@ -48,6 +48,16 @@ fn request(
 fn server_with_root(
     root: String,
 ) -> ServerConfig {
+    server_with_root_and_listing(
+        root,
+        false,
+    )
+}
+
+fn server_with_root_and_listing(
+    root: String,
+    directory_listing: bool,
+) -> ServerConfig {
     ServerConfig {
         server_address:
             "127.0.0.1".to_string(),
@@ -84,8 +94,7 @@ fn server_with_root(
                                 .to_string()
                         ),
 
-                    directory_listing:
-                        false,
+                    directory_listing,
 
                     redirect:
                         None,
@@ -306,6 +315,151 @@ fn traversal_is_forbidden() {
     assert_eq!(
         response.status,
         StatusCode::Forbidden
+    );
+
+    let _ =
+        fs::remove_dir_all(
+            root
+        );
+}
+
+#[test]
+fn directory_without_index_is_forbidden_when_listing_disabled() {
+    let root =
+        temporary_directory();
+
+    let server =
+        server_with_root(
+            root
+                .to_string_lossy()
+                .to_string()
+        );
+
+    let response =
+        handle_static_request(
+            &request(
+                Method::Get,
+                "/",
+            ),
+            &server,
+        );
+
+    assert_eq!(
+        response.status,
+        StatusCode::Forbidden
+    );
+
+    let _ =
+        fs::remove_dir_all(
+            root
+        );
+}
+
+#[test]
+fn directory_listing_is_served_when_enabled() {
+    let root =
+        temporary_directory();
+
+    fs::write(
+        root.join("a.txt"),
+        b"a",
+    )
+    .unwrap();
+
+    fs::create_dir(
+        root.join("sub")
+    )
+    .unwrap();
+
+    let server =
+        server_with_root_and_listing(
+            root
+                .to_string_lossy()
+                .to_string(),
+            true,
+        );
+
+    let response =
+        handle_static_request(
+            &request(
+                Method::Get,
+                "/",
+            ),
+            &server,
+        );
+
+    assert_eq!(
+        response.status,
+        StatusCode::Ok
+    );
+
+    let body =
+        String::from_utf8(
+            response.body.clone()
+        )
+        .unwrap();
+
+    assert!(
+        body.contains(
+            "a.txt"
+        )
+    );
+
+    assert!(
+        body.contains(
+            "sub/"
+        )
+    );
+
+    let _ =
+        fs::remove_dir_all(
+            root
+        );
+}
+
+#[test]
+fn response_includes_date_header() {
+    let root =
+        temporary_directory();
+
+    fs::write(
+        root.join("index.html"),
+        b"hello",
+    )
+    .unwrap();
+
+    let server =
+        server_with_root(
+            root
+                .to_string_lossy()
+                .to_string()
+        );
+
+    let response =
+        handle_static_request(
+            &request(
+                Method::Get,
+                "/",
+            ),
+            &server,
+        );
+
+    let raw =
+        String::from_utf8(
+            response.to_bytes()
+        )
+        .unwrap();
+
+    assert!(
+        raw.contains(
+            "Date: "
+        )
+    );
+
+    assert!(
+        raw.contains(
+            " GMT\r\n"
+        )
     );
 
     let _ =
