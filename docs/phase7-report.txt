@@ -1,0 +1,199 @@
+Phase 7 Report — Request Bodies, POST, Chunked Encoding, and Uploads
+
+Phase:
+Phase 7 — Request Bodies, POST, Chunked Encoding, and Uploads.
+
+Implemented:
+
+1. Chunked-transfer-encoding decoder (src/http/parser.rs::decode_chunked_body).
+   Transfer-Encoding: chunked was previously only recognized (framing
+   detection), with actual decoding stubbed as an error. Now fully
+   implemented per RFC 7230 section 4.1: chunk-size line (with
+   optional chunk-extension, ignored) -> chunk-data -> CRLF, repeated
+   until a zero-size final chunk, followed by an optional trailer
+   section and a terminating CRLF. Chunk-size lines, chunk data, and
+   trailers can each be split across separate TCP reads; the decoder
+   returns ParseResult::Incomplete whenever the buffer runs out
+   mid-element, matching the existing Content-Length incremental
+   parsing behavior. No new socket reads are triggered by this -
+   parsing only re-runs against the connection's already-buffered
+   read_buf, per the project's one-read-per-dispatch invariant.
+
+2. Body-size limiting, two-tier (src/http/parser.rs, src/server/event_loop.rs,
+   src/http/static_files.rs).
+   - Parse-time cap: parse_request now takes a max_body_size
+     parameter and rejects (ParseError::BodyTooLarge) any
+     Content-Length or chunked body that would exceed it, before
+     buffering the excess. EventLoop computes this cap once at
+     construction as the maximum client_max_body_size across every
+     configured server (server selection/routing hasn't happened yet
+     at parse time, so this is a memory-safety ceiling, not the
+     final answer).
+   - Route-time cap: after routing selects the specific server,
+     handle_static_request re-checks request.body.len() against that
+     server's own (possibly smaller) client_max_body_size and returns
+     413 if exceeded. This is the authoritative, config-accurate
+     check; the parse-time cap only exists to stop a client from
+     forcing unbounded buffering before routing can happen.
+   - ParseError::BodyTooLarge is now distinguished from other parse
+     errors in event_loop.rs and produces a 413 response (via the new
+     http_handler::payload_too_large_response) instead of the generic
+     400 used for other malformed requests.
+
+3. POST / file uploads (src/http/static_files.rs::handle_upload).
+   POST to any route resolves the request path against the route's
+   root exactly the way GET already does (same relative-path
+   computation, same is_safe_relative_path traversal check), then
+   writes request.body to that filesystem location. Design decision
+   (confirmed with the user): path-as-filename - the request path
+   determines where the file is written, no server-generated names.
+   - Returns 201 Created with a Location header equal to the request
+     path on success.
+   - The immediate parent directory must already exist inside the
+     route's root; handle_upload does not create directories.
+     Missing parent -> 404. This mirrors how GET already treats a
+     missing path.
+   - The parent directory is canonicalized and checked against the
+     canonicalized route root before any write, exactly like GET's
+     symlink/traversal containment check - an upload cannot escape
+     the route root any more than a GET can.
+   - Uploading onto a path that is currently a directory, or POSTing
+     to a route with an empty/"/"-terminated relative path (no
+     filename), returns 403 rather than silently doing something
+     surprising.
+   - Overwriting an existing file is allowed (fs::write truncates and
+     replaces); no separate "create vs. replace" distinction is made,
+     since the spec doesn't require one and this is an interview
+     project, not a production system.
+
+Files changed:
+- src/http/parser.rs — decode_chunked_body, parse_chunk_size,
+  find_crlf, find_crlf_crlf_or_bare_crlf; parse_request signature
+  gained max_body_size; ParseError gained InvalidChunkSize and
+  BodyTooLarge, lost the now-unreachable ChunkedBodyNotDecodedYet.
+- src/server/event_loop.rs — EventLoop now computes and stores
+  max_body_size at construction; passes it into parse_request;
+  distinguishes BodyTooLarge to return 413 instead of 400.
+- src/server/http_handler.rs — added payload_too_large_response,
+  mirroring bad_request_response.
+- src/http/static_files.rs — handle_static_request now dispatches
+  POST to the new handle_upload; added a per-server body-size check
+  before redirect/serving logic runs.
+- src/http/response.rs — added StatusCode::Created (201).
+- tests/http_parser_phase4.rs — updated all parse_request call sites
+  to the new 2-argument signature (existing behavior unchanged; a
+  generous 1 MiB cap was used so no existing test's expectations
+  needed to change).
+- tests/chunked_body_phase7.rs — new file, 12 tests.
+- tests/uploads_phase7.rs — new file, 9 tests.
+
+Tests added:
+tests/chunked_body_phase7.rs (12 tests):
+- decodes_single_chunk, decodes_multiple_chunks,
+  empty_chunked_body_is_accepted, trailers_after_final_chunk_are_consumed,
+  chunk_size_split_across_reads_is_incomplete_then_completes,
+  chunk_data_split_across_reads_is_incomplete_then_completes,
+  missing_final_chunk_is_incomplete, malformed_chunk_size_is_rejected,
+  missing_chunk_terminator_is_rejected, chunk_extension_is_ignored,
+  chunked_body_over_limit_is_rejected,
+  content_length_body_over_limit_is_rejected.
+
+tests/uploads_phase7.rs (9 tests):
+- post_writes_file_and_returns_201, post_overwrites_existing_file,
+  post_into_nested_existing_directory_succeeds,
+  post_into_missing_parent_directory_returns_404,
+  post_traversal_attempt_is_forbidden,
+  post_to_directory_path_is_forbidden,
+  post_onto_existing_directory_name_is_forbidden,
+  post_over_server_body_limit_returns_413,
+  get_after_post_serves_uploaded_content.
+
+Tests executed:
+cargo check — clean, zero warnings.
+cargo test — 87/87 passing (14 unit, 10 config, 16 HTTP parser, 9 HTTP
+response/static-file, 7 networking, 10 routing, 12 chunked-body,
+9 upload tests).
+
+One test-authoring bug was caught and fixed during this session: the
+first draft of decodes_multiple_chunks used an incorrect hex
+chunk-size for a chunk whose literal byte length didn't match the
+declared size (a copy-paste mistake from the RFC 7230 Wikipedia
+example, adapted incorrectly). This was diagnosed by adding temporary
+eprintln instrumentation to decode_chunked_body and a scratch example
+binary, confirming the decoder's offset arithmetic was correct and
+the test data was wrong; the instrumentation was removed afterward.
+This is called out explicitly per the "verify before claiming
+success" rule — the failure was in the test fixture, not the
+implementation, but that was established by evidence, not assumption.
+
+Manual verification against the built binary:
+- POST with a plain Content-Length body to /uploads/hello.txt via
+  config.toml -> 201 Created, Location header correct, file written
+  to ./uploads/hello.txt with exact byte content, verified via `cat`.
+- POST with Transfer-Encoding: chunked (curl's own chunked transfer)
+  to /uploads/chunked.txt -> 201 Created, file content correct.
+- GET of a previously-POSTed file -> 200, correct Content-Type and
+  body, proving the round trip works over real sockets, not just in
+  the unit-test harness.
+- A second config with client_max_body_size = 5: POST of a body
+  longer than 5 bytes -> 413 Payload Too Large with Connection: close
+  and the default error page; POST of a 2-byte body -> 201 Created.
+  Confirms the per-server limit is enforced on the live event-loop
+  path, not just in the direct-call test harness.
+
+Known limitations:
+- No dedicated "upload directory" config concept exists; uploads are
+  written wherever the matched route's root + request path resolve
+  to, same as static GET. This was a deliberate simplification
+  (confirmed with the user) rather than an oversight - it reuses
+  exactly the traversal-safety machinery GET already has instead of
+  introducing a second, parallel path-resolution scheme.
+- DELETE is out of scope for this phase (Phase 8) and remains
+  unimplemented; a route configured with DELETE in its methods list
+  will pass method_allowed but static_files.rs has no DELETE branch
+  yet, so it will currently fall through to the GET/static-serving
+  path. This should be revisited at the start of Phase 8 rather than
+  left as a silent gap.
+- Chunk-extension parameters (the "; ext=value" part of a chunk-size
+  line) are recognized syntactically and discarded, never inspected
+  or validated. This matches RFC 7230's guidance that recipients may
+  ignore chunk extensions they don't understand.
+- Trailer header lines are consumed as part of locating the end of a
+  chunked body but are not parsed into Header structs or exposed to
+  the application layer. The spec doesn't require trailer semantics,
+  only correct body-boundary handling, which this satisfies.
+
+Audit requirements satisfied:
+- Content-Length request bodies (already present from Phase 4,
+  unchanged in framing detection).
+- Chunked request bodies, including chunk boundaries split across
+  reads, chunk size split across reads, empty chunks, the final
+  zero-size chunk, and trailers.
+- Body-size limits enforced without unbounded memory allocation based
+  on client-controlled values (Content-Length is capped before the
+  buffer is even checked for completeness; chunked bodies are capped
+  incrementally as each chunk is decoded, not after the fact).
+- POST implemented as file upload with correct status codes.
+- Uploaded files verified not corrupted via round-trip GET, both in
+  the test suite and manually over real sockets.
+- 413 Payload Too Large returned with the connection left in a
+  well-defined state (Connection: close, per the same pattern already
+  used for 400 responses).
+
+Remaining risks:
+- handle_upload performs fs::write synchronously inside request
+  handling, same as existing fs::read for GET - consistent with the
+  project's current treatment of filesystem I/O as fast/local, not
+  something proxied through epoll. Worth keeping in mind if large
+  uploads ever need backpressure, though that's explicitly out of
+  scope for an interview-scale project.
+- No test yet exercises a chunked POST upload through the live
+  event-loop/socket path with a strictly single-byte-at-a-time writer
+  (only curl's own chunked transfer was used for manual verification,
+  which may batch chunks differently than a maximally fragmented
+  client). The unit-level split-across-reads tests in
+  chunked_body_phase7.rs cover the fragmentation logic directly
+  against parse_request, which is the actual code path event_loop.rs
+  drives, so this is considered adequately covered, but a live
+  fragmented-chunked-POST test would be a reasonable addition during
+  Phase 12's integration suite.

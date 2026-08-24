@@ -15,7 +15,7 @@ Host: localhost\r\n\
 \r\n";
 
     let result =
-        parse_request(raw).unwrap();
+        parse_request(raw, 1024 * 1024).unwrap();
 
     match result {
         ParseResult::Complete {
@@ -69,7 +69,7 @@ Host: localhost\r\n\
 \r\n";
 
     let result =
-        parse_request(raw).unwrap();
+        parse_request(raw, 1024 * 1024).unwrap();
 
     match result {
         ParseResult::Complete {
@@ -107,7 +107,7 @@ Content-Length: 5\r\n\
 hello";
 
     let result =
-        parse_request(raw).unwrap();
+        parse_request(raw, 1024 * 1024).unwrap();
 
     match result {
         ParseResult::Complete {
@@ -145,7 +145,7 @@ fn partial_request_is_incomplete() {
 Host: local";
 
     let result =
-        parse_request(raw).unwrap();
+        parse_request(raw, 1024 * 1024).unwrap();
 
     assert_eq!(
         result,
@@ -163,7 +163,7 @@ Content-Length: 5\r\n\
 hel";
 
     let result =
-        parse_request(raw).unwrap();
+        parse_request(raw, 1024 * 1024).unwrap();
 
     assert_eq!(
         result,
@@ -179,7 +179,7 @@ User-Agent: test\r\n\
 \r\n";
 
     let result =
-        parse_request(raw);
+        parse_request(raw, 1024 * 1024);
 
     assert!(matches!(
         result,
@@ -196,7 +196,7 @@ Host: two.local\r\n\
 \r\n";
 
     let result =
-        parse_request(raw);
+        parse_request(raw, 1024 * 1024);
 
     assert!(matches!(
         result,
@@ -212,7 +212,7 @@ Host: localhost\r\n\
 \r\n";
 
     let result =
-        parse_request(raw);
+        parse_request(raw, 1024 * 1024);
 
     assert!(matches!(
         result,
@@ -230,7 +230,7 @@ Host localhost\r\n\
 \r\n";
 
     let result =
-        parse_request(raw);
+        parse_request(raw, 1024 * 1024);
 
     assert!(matches!(
         result,
@@ -246,7 +246,7 @@ Host: localhost\r\n\
 \r\n";
 
     let result =
-        parse_request(raw).unwrap();
+        parse_request(raw, 1024 * 1024).unwrap();
 
     match result {
         ParseResult::Complete {
@@ -279,7 +279,7 @@ Content-Length: 10\r\n\
 \r\n";
 
     let result =
-        parse_request(raw);
+        parse_request(raw, 1024 * 1024);
 
     assert!(matches!(
         result,
@@ -349,7 +349,7 @@ USER-AGENT: test\r\n\
 \r\n";
 
     let result =
-        parse_request(raw).unwrap();
+        parse_request(raw, 1024 * 1024).unwrap();
 
     match result {
         ParseResult::Complete {
@@ -386,7 +386,7 @@ Content-Length: 5\r\n\
 hello";
 
     let result =
-        parse_request(raw);
+        parse_request(raw, 1024 * 1024);
 
     assert!(matches!(
         result,
@@ -406,7 +406,7 @@ Host: localhost\r\n\
 \r\n";
 
     let result =
-        parse_request(raw).unwrap();
+        parse_request(raw, 1024 * 1024).unwrap();
 
     match result {
         ParseResult::Complete {

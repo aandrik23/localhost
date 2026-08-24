@@ -5,6 +5,7 @@ use crate::config::Config;
 
 use crate::http::{
     parse_request,
+    ParseError,
     ParseResult,
 };
 
@@ -37,6 +38,7 @@ use crate::server::connection::{
 use crate::server::http_handler::{
     bad_request_response,
     handle_request,
+    payload_too_large_response,
 };
 
 const READ_CHUNK: usize = 16 * 1024;
@@ -54,6 +56,13 @@ pub struct EventLoop {
         Vec<EpollEvent>,
 
     config: Config,
+
+    /*
+     * Used as a connection-level cap while parsing, before routing
+     * selects a specific server whose
+     * limit actually applies. See http::parse_request.
+     */
+    max_body_size: usize,
 }
 
 impl EventLoop {
@@ -79,6 +88,14 @@ impl EventLoop {
             );
         }
 
+        let max_body_size =
+            config
+                .servers
+                .iter()
+                .map(|server| server.client_max_body_size)
+                .max()
+                .unwrap_or(0);
+
         Ok(Self {
             epoll,
 
@@ -92,6 +109,8 @@ impl EventLoop {
                 Vec::with_capacity(1024),
 
             config,
+
+            max_body_size,
         })
     }
 
@@ -309,6 +328,12 @@ impl EventLoop {
                 let mut parse_failed =
                     false;
 
+                let mut body_too_large =
+                    false;
+
+                let max_body_size =
+                    self.max_body_size;
+
                 if let Some(connection) =
                     self
                         .connections
@@ -323,14 +348,12 @@ impl EventLoop {
                     connection.touch();
 
                     /*
-                     * We may parse multiple HTTP requests from
-                     * already buffered bytes.
-                     *
                      * This does NOT perform another socket read.
                      */
                     loop {
                         match parse_request(
                             &connection.read_buf,
+                            max_body_size,
                         ) {
                             Ok(
                                 ParseResult::Complete {
@@ -364,6 +387,9 @@ impl EventLoop {
                                     connection.peer_port,
                                     err
                                 );
+
+                                body_too_large =
+                                    err == ParseError::BodyTooLarge;
 
                                 parse_failed =
                                     true;
@@ -442,14 +468,20 @@ impl EventLoop {
                 }
 
                 /*
-                 * Malformed HTTP gets a real 400 response now
+                 * Malformed HTTP gets a real 400/413 response now
                  * instead of silently dropping the connection.
                  */
                 if parse_failed {
                     let response =
-                        bad_request_response(
-                            &self.config
-                        );
+                        if body_too_large {
+                            payload_too_large_response(
+                                &self.config
+                            )
+                        } else {
+                            bad_request_response(
+                                &self.config
+                            )
+                        };
 
                     let bytes =
                         response.to_bytes();

@@ -103,6 +103,7 @@ fn civil_from_days(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusCode {
     Ok,
+    Created,
     MovedPermanently,
     Found,
     SeeOther,
@@ -134,6 +135,7 @@ impl StatusCode {
     pub fn code(self) -> u16 {
         match self {
             StatusCode::Ok => 200,
+            StatusCode::Created => 201,
             StatusCode::MovedPermanently => 301,
             StatusCode::Found => 302,
             StatusCode::SeeOther => 303,
@@ -151,6 +153,7 @@ impl StatusCode {
     pub fn reason_phrase(self) -> &'static str {
         match self {
             StatusCode::Ok => "OK",
+            StatusCode::Created => "Created",
             StatusCode::MovedPermanently => "Moved Permanently",
             StatusCode::Found => "Found",
             StatusCode::SeeOther => "See Other",

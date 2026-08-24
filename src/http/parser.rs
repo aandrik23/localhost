@@ -54,7 +54,9 @@ pub enum ParseError {
 
     UnsupportedTransferEncoding(String),
 
-    ChunkedBodyNotDecodedYet,
+    InvalidChunkSize,
+
+    BodyTooLarge,
 }
 
 impl fmt::Display for ParseError {
@@ -135,10 +137,17 @@ impl fmt::Display for ParseError {
                 )
             }
 
-            ParseError::ChunkedBodyNotDecodedYet => {
+            ParseError::InvalidChunkSize => {
                 write!(
                     f,
-                    "chunked body decoding belongs to Phase 7"
+                    "invalid chunk size in chunked request body"
+                )
+            }
+
+            ParseError::BodyTooLarge => {
+                write!(
+                    f,
+                    "request body exceeds the configured limit"
                 )
             }
         }
@@ -155,8 +164,9 @@ impl std::error::Error for ParseError {}
 /// - If the header section is valid -> Complete
 /// - Malformed HTTP -> ParseError
 ///
-/// Chunked requests are RECOGNIZED here, but actual chunk decoding
-/// will be added in Phase 7.
+/// This function only recognizes chunked framing (via the
+/// Transfer-Encoding header); chunk decoding happens in
+/// parse_request.
 pub fn parse_request_head(
     buffer: &[u8],
 ) -> Result<ParseResult<RequestHead>, ParseError> {
@@ -232,15 +242,19 @@ pub fn parse_request_head(
     })
 }
 
-/// Parses one complete non-chunked HTTP request.
+/// Parses one complete HTTP request, including Content-Length and
+/// chunked bodies.
 ///
-/// If Content-Length says that more bytes are required,
-/// ParseResult::Incomplete is returned.
-///
-/// Chunked framing is already recognized, but its body decoder
-/// will be implemented during Phase 7.
+/// `max_body_size` bounds how large a decoded body may grow while
+/// parsing. This is a connection-level, not yet route-aware, cap: it
+/// exists purely to stop a client from making the server buffer an
+/// unbounded amount of memory before routing/config-specific limits
+/// can be checked. Callers should still re-check the final body
+/// length against the selected server's configured
+/// client_max_body_size after routing.
 pub fn parse_request(
     buffer: &[u8],
+    max_body_size: usize,
 ) -> Result<ParseResult<HttpRequest>, ParseError> {
     let (
         head,
@@ -258,35 +272,56 @@ pub fn parse_request(
         }
     };
 
-    let body_length =
+    let (body, total_length) =
         match head.body_framing {
-            BodyFraming::None => 0,
+            BodyFraming::None => {
+                (Vec::new(), header_consumed)
+            }
 
             BodyFraming::ContentLength(length) => {
-                length
+                if length > max_body_size {
+                    return Err(ParseError::BodyTooLarge);
+                }
+
+                let total_length =
+                    header_consumed
+                        .checked_add(length)
+                        .ok_or(ParseError::InvalidContentLength)?;
+
+                if buffer.len() < total_length {
+                    return Ok(ParseResult::Incomplete);
+                }
+
+                let body =
+                    buffer[header_consumed..total_length]
+                        .to_vec();
+
+                (body, total_length)
             }
 
             BodyFraming::Chunked => {
-                return Err(
-                    ParseError::ChunkedBodyNotDecodedYet
-                );
+                let remaining = &buffer[header_consumed..];
+
+                match decode_chunked_body(
+                    remaining,
+                    max_body_size,
+                )? {
+                    ParseResult::Incomplete => {
+                        return Ok(ParseResult::Incomplete);
+                    }
+
+                    ParseResult::Complete {
+                        value: body,
+                        consumed: body_consumed,
+                    } => {
+                        (
+                            body,
+                            header_consumed + body_consumed,
+                        )
+                    }
+                }
             }
         };
-
-    let total_length =
-        header_consumed
-            .checked_add(body_length)
-            .ok_or(ParseError::InvalidContentLength)?;
-
-    if buffer.len() < total_length {
-        return Ok(ParseResult::Incomplete);
-    }
-
-    let body =
-        buffer[
-            header_consumed..total_length
-        ]
-            .to_vec();
 
     Ok(ParseResult::Complete {
         value: HttpRequest {
@@ -301,6 +336,167 @@ pub fn parse_request(
 
         consumed: total_length,
     })
+}
+
+/// Decodes a chunked-transfer-encoding message body.
+///
+/// `buffer` starts right after the request headers, at the first
+/// chunk-size line. Handles chunk boundaries, chunk sizes, and
+/// trailers split across separate reads by returning
+/// `ParseResult::Incomplete` whenever the buffer runs out before a
+/// full element (chunk-size line, chunk data + CRLF, or trailer
+/// section) has arrived.
+///
+/// Format (RFC 7230 section 4.1):
+///
+/// chunk-size [ ";" chunk-ext ] CRLF
+/// chunk-data CRLF
+/// ...
+/// "0" [ ";" chunk-ext ] CRLF
+/// trailer-part
+/// CRLF
+fn decode_chunked_body(
+    buffer: &[u8],
+    max_body_size: usize,
+) -> Result<ParseResult<Vec<u8>>, ParseError> {
+    let mut body = Vec::new();
+
+    let mut offset = 0;
+
+    loop {
+        let line_end =
+            match find_crlf(&buffer[offset..]) {
+                Some(position) => offset + position,
+
+                None => {
+                    return Ok(ParseResult::Incomplete);
+                }
+            };
+
+        let size_line = &buffer[offset..line_end];
+
+        let chunk_size =
+            parse_chunk_size(size_line)?;
+
+        offset = line_end + 2;
+
+        if chunk_size == 0 {
+            /*
+             * Final chunk. What follows is an optional trailer
+             * section (zero or more header-like lines) terminated
+             * by a blank line.
+             */
+            let trailer_end =
+                match find_crlf_crlf_or_bare_crlf(
+                    &buffer[offset..]
+                ) {
+                    Some(position) => offset + position,
+
+                    None => {
+                        return Ok(ParseResult::Incomplete);
+                    }
+                };
+
+            let consumed = trailer_end + 2;
+
+            return Ok(ParseResult::Complete {
+                value: body,
+                consumed,
+            });
+        }
+
+        let new_len =
+            body.len()
+                .checked_add(chunk_size)
+                .ok_or(ParseError::BodyTooLarge)?;
+
+        if new_len > max_body_size {
+            return Err(ParseError::BodyTooLarge);
+        }
+
+        let data_end =
+            match offset.checked_add(chunk_size) {
+                Some(end) => end,
+
+                None => {
+                    return Err(ParseError::InvalidChunkSize);
+                }
+            };
+
+        // Chunk data must be followed by CRLF.
+        let terminator_end =
+            match data_end.checked_add(2) {
+                Some(end) => end,
+
+                None => {
+                    return Err(ParseError::InvalidChunkSize);
+                }
+            };
+
+        if buffer.len() < terminator_end {
+            return Ok(ParseResult::Incomplete);
+        }
+
+        if &buffer[data_end..terminator_end] != b"\r\n" {
+            return Err(ParseError::InvalidChunkSize);
+        }
+
+        body.extend_from_slice(
+            &buffer[offset..data_end],
+        );
+
+        offset = terminator_end;
+    }
+}
+
+/// Parses a chunk-size line, ignoring any chunk-extension after ';'.
+fn parse_chunk_size(
+    line: &[u8],
+) -> Result<usize, ParseError> {
+    let hex_part =
+        match line.iter().position(|&byte| byte == b';') {
+            Some(index) => &line[..index],
+
+            None => line,
+        };
+
+    if hex_part.is_empty() {
+        return Err(ParseError::InvalidChunkSize);
+    }
+
+    let text =
+        str::from_utf8(hex_part)
+            .map_err(|_| ParseError::InvalidChunkSize)?;
+
+    usize::from_str_radix(text.trim(), 16)
+        .map_err(|_| ParseError::InvalidChunkSize)
+}
+
+/// Finds the offset of the next "\r\n" in `buffer`.
+fn find_crlf(
+    buffer: &[u8],
+) -> Option<usize> {
+    buffer
+        .windows(2)
+        .position(|window| window == b"\r\n")
+}
+
+/// Finds the end of the trailer section following the final ("0")
+/// chunk: either an immediate "\r\n" (no trailers) or a "\r\n\r\n"
+/// terminating one or more trailer header lines.
+///
+/// Returns the offset of the start of the terminating "\r\n".
+fn find_crlf_crlf_or_bare_crlf(
+    buffer: &[u8],
+) -> Option<usize> {
+    if buffer.len() >= 2 && &buffer[..2] == b"\r\n" {
+        return Some(0);
+    }
+
+    buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 2)
 }
 
 fn parse_request_line(

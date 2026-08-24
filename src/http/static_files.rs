@@ -40,6 +40,20 @@ pub fn handle_static_request(
         );
     }
 
+    /*
+     * The connection-level cap in http::parse_request only protects
+     * against unbounded memory use while parsing; it uses the
+     * largest client_max_body_size across every configured server.
+     * Now that routing has selected the specific server, enforce
+     * its own (possibly smaller) limit.
+     */
+    if request.body.len() > server.client_max_body_size {
+        return error_response(
+            server,
+            StatusCode::PayloadTooLarge,
+        );
+    }
+
     if let Some(location) = &route.redirect {
         let status = StatusCode::from_redirect_status(
             route.redirect_status.unwrap_or(302),
@@ -78,6 +92,15 @@ pub fn handle_static_request(
         return error_response(
             server,
             StatusCode::Forbidden,
+        );
+    }
+
+    if request.method == Method::Post {
+        return handle_upload(
+            request,
+            server,
+            &root,
+            relative_path,
         );
     }
 
@@ -251,6 +274,144 @@ pub fn handle_static_request(
             &canonical_file
         ),
     )
+}
+
+/// Handles POST as a file upload: the request body is written to the
+/// filesystem at `root` joined with `relative_path`, mirroring how
+/// GET resolves the same path for static serving.
+///
+/// Returns 201 Created with a Location header on success. The parent
+/// directory must already exist inside the route's root; this
+/// function does not create directories on the client's behalf.
+fn handle_upload(
+    request: &HttpRequest,
+    server: &ServerConfig,
+    root: &Path,
+    relative_path: &str,
+) -> HttpResponse {
+    if relative_path.is_empty()
+        || relative_path.ends_with('/')
+    {
+        return error_response(
+            server,
+            StatusCode::Forbidden,
+        );
+    }
+
+    let target_path =
+        root.join(relative_path);
+
+    let parent =
+        match target_path.parent() {
+            Some(parent) => parent,
+
+            None => {
+                return error_response(
+                    server,
+                    StatusCode::Forbidden,
+                );
+            }
+        };
+
+    let canonical_root =
+        match fs::canonicalize(root) {
+            Ok(path) => path,
+
+            Err(_) => {
+                return error_response(
+                    server,
+                    StatusCode::InternalServerError,
+                );
+            }
+        };
+
+    let canonical_parent =
+        match fs::canonicalize(parent) {
+            Ok(path) => path,
+
+            Err(err) => {
+                return match err.kind() {
+                    io::ErrorKind::NotFound => {
+                        error_response(
+                            server,
+                            StatusCode::NotFound,
+                        )
+                    }
+
+                    io::ErrorKind::PermissionDenied => {
+                        error_response(
+                            server,
+                            StatusCode::Forbidden,
+                        )
+                    }
+
+                    _ => {
+                        error_response(
+                            server,
+                            StatusCode::InternalServerError,
+                        )
+                    }
+                };
+            }
+        };
+
+    /*
+     * Same containment rule as GET: the resolved parent directory
+     * must never escape the configured route root, even through
+     * symlinks.
+     */
+    if !canonical_parent.starts_with(&canonical_root) {
+        return error_response(
+            server,
+            StatusCode::Forbidden,
+        );
+    }
+
+    let final_path =
+        canonical_parent.join(
+            target_path
+                .file_name()
+                .unwrap_or_default(),
+        );
+
+    /*
+     * Refuse to overwrite an existing directory with a file upload.
+     */
+    if final_path.is_dir() {
+        return error_response(
+            server,
+            StatusCode::Forbidden,
+        );
+    }
+
+    match fs::write(&final_path, &request.body) {
+        Ok(()) => {
+            HttpResponse::new(
+                StatusCode::Created,
+                Vec::new(),
+            )
+            .with_header(
+                "Location",
+                request.path.clone(),
+            )
+        }
+
+        Err(err) => match err.kind() {
+            io::ErrorKind::PermissionDenied => {
+                error_response(
+                    server,
+                    StatusCode::Forbidden,
+                )
+            }
+
+            _ => {
+                error_response(
+                    server,
+                    StatusCode::InternalServerError,
+                )
+            }
+        },
+    }
 }
 
 pub fn error_response(
