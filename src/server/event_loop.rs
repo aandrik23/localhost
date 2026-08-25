@@ -41,7 +41,15 @@ use crate::server::http_handler::{
     payload_too_large_response,
 };
 
+use crate::server::session::SessionStore;
+
 const READ_CHUNK: usize = 16 * 1024;
+
+/// How often tick() sweeps expired sessions. Swept opportunistically
+/// from the event loop rather than a background thread, per the
+/// project's one-thread constraint.
+const SESSION_SWEEP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
 
 pub struct EventLoop {
     epoll: Epoll,
@@ -63,6 +71,15 @@ pub struct EventLoop {
      * limit actually applies. See http::parse_request.
      */
     max_body_size: usize,
+
+    /*
+     * Owned by the single server thread; no synchronization needed.
+     * Expiration is swept from tick(), never from a background
+     * thread.
+     */
+    sessions: SessionStore,
+
+    last_session_sweep: std::time::Instant,
 }
 
 impl EventLoop {
@@ -111,6 +128,10 @@ impl EventLoop {
             config,
 
             max_body_size,
+
+            sessions: SessionStore::new(),
+
+            last_session_sweep: std::time::Instant::now(),
         })
     }
 
@@ -138,6 +159,15 @@ impl EventLoop {
         &mut self,
         timeout_ms: i32,
     ) -> io::Result<usize> {
+        if self.last_session_sweep.elapsed()
+            >= SESSION_SWEEP_INTERVAL
+        {
+            self.sessions.sweep_expired();
+
+            self.last_session_sweep =
+                std::time::Instant::now();
+        }
+
         let count =
             self.epoll.wait(
                 &mut self.events_buf,
@@ -450,6 +480,7 @@ impl EventLoop {
                             &request,
                             local_addr,
                             local_port,
+                            &mut self.sessions,
                         );
 
                     let bytes =

@@ -104,6 +104,14 @@ pub fn handle_static_request(
         );
     }
 
+    if request.method == Method::Delete {
+        return handle_delete(
+            server,
+            &root,
+            relative_path,
+        );
+    }
+
     let mut requested_path =
         root.join(relative_path);
 
@@ -397,6 +405,124 @@ fn handle_upload(
         }
 
         Err(err) => match err.kind() {
+            io::ErrorKind::PermissionDenied => {
+                error_response(
+                    server,
+                    StatusCode::Forbidden,
+                )
+            }
+
+            _ => {
+                error_response(
+                    server,
+                    StatusCode::InternalServerError,
+                )
+            }
+        },
+    }
+}
+
+/// Handles DELETE: removes a single file at `root` joined with
+/// `relative_path`.
+///
+/// Directories are never deleted (returns 403), even if the
+/// filesystem would allow it - the spec calls out "directories where
+/// deletion is not allowed" as a case to handle explicitly, and this
+/// keeps DELETE's blast radius limited to exactly one file, matching
+/// how POST/GET are also single-file operations here.
+fn handle_delete(
+    server: &ServerConfig,
+    root: &Path,
+    relative_path: &str,
+) -> HttpResponse {
+    if relative_path.is_empty()
+        || relative_path.ends_with('/')
+    {
+        return error_response(
+            server,
+            StatusCode::Forbidden,
+        );
+    }
+
+    let target_path =
+        root.join(relative_path);
+
+    let canonical_root =
+        match fs::canonicalize(root) {
+            Ok(path) => path,
+
+            Err(_) => {
+                return error_response(
+                    server,
+                    StatusCode::InternalServerError,
+                );
+            }
+        };
+
+    let canonical_target =
+        match fs::canonicalize(&target_path) {
+            Ok(path) => path,
+
+            Err(err) => {
+                return match err.kind() {
+                    io::ErrorKind::NotFound => {
+                        error_response(
+                            server,
+                            StatusCode::NotFound,
+                        )
+                    }
+
+                    io::ErrorKind::PermissionDenied => {
+                        error_response(
+                            server,
+                            StatusCode::Forbidden,
+                        )
+                    }
+
+                    _ => {
+                        error_response(
+                            server,
+                            StatusCode::InternalServerError,
+                        )
+                    }
+                };
+            }
+        };
+
+    /*
+     * Same containment rule as GET/POST: the resolved target must
+     * never escape the configured route root, even through symlinks.
+     */
+    if !canonical_target.starts_with(&canonical_root) {
+        return error_response(
+            server,
+            StatusCode::Forbidden,
+        );
+    }
+
+    if canonical_target.is_dir() {
+        return error_response(
+            server,
+            StatusCode::Forbidden,
+        );
+    }
+
+    match fs::remove_file(&canonical_target) {
+        Ok(()) => {
+            HttpResponse::new(
+                StatusCode::NoContent,
+                Vec::new(),
+            )
+        }
+
+        Err(err) => match err.kind() {
+            io::ErrorKind::NotFound => {
+                error_response(
+                    server,
+                    StatusCode::NotFound,
+                )
+            }
+
             io::ErrorKind::PermissionDenied => {
                 error_response(
                     server,

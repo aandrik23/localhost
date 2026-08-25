@@ -141,4 +141,31 @@ impl HttpRequest {
             })
             .map(|header| header.value.as_str())
     }
+
+    /// Returns the value of one cookie from the Cookie request
+    /// header, if present.
+    pub fn cookie(&self, name: &str) -> Option<&str> {
+        self.header_values("cookie")
+            .flat_map(parse_cookie_pairs)
+            .find(|(pair_name, _)| *pair_name == name)
+            .map(|(_, value)| value)
+    }
+}
+
+/// Splits one Cookie header value into (name, value) pairs.
+fn parse_cookie_pairs(
+    header_value: &str,
+) -> impl Iterator<Item = (&str, &str)> {
+    header_value
+        .split(';')
+        .filter_map(|pair| {
+            let pair = pair.trim();
+
+            if pair.is_empty() {
+                return None;
+            }
+
+            pair.split_once('=')
+                .map(|(name, value)| (name.trim(), value.trim()))
+        })
 }

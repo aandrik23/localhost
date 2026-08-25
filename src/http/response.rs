@@ -104,6 +104,7 @@ fn civil_from_days(
 pub enum StatusCode {
     Ok,
     Created,
+    NoContent,
     MovedPermanently,
     Found,
     SeeOther,
@@ -136,6 +137,7 @@ impl StatusCode {
         match self {
             StatusCode::Ok => 200,
             StatusCode::Created => 201,
+            StatusCode::NoContent => 204,
             StatusCode::MovedPermanently => 301,
             StatusCode::Found => 302,
             StatusCode::SeeOther => 303,
@@ -154,6 +156,7 @@ impl StatusCode {
         match self {
             StatusCode::Ok => "OK",
             StatusCode::Created => "Created",
+            StatusCode::NoContent => "No Content",
             StatusCode::MovedPermanently => "Moved Permanently",
             StatusCode::Found => "Found",
             StatusCode::SeeOther => "See Other",

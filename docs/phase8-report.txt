@@ -1,0 +1,202 @@
+Phase 8 Report — DELETE, Cookies, and Sessions
+
+Phase:
+Phase 8 — DELETE, Cookies, and Sessions.
+
+Implemented:
+
+1. DELETE (src/http/static_files.rs::handle_delete).
+   DELETE was previously recognized only as a Method enum variant and
+   accepted by config validation; a request with method DELETE fell
+   through to the GET/static-serving code path (a known gap flagged
+   explicitly in the Phase 7 report). It now has its own branch in
+   handle_static_request, parallel to the existing POST/handle_upload
+   dispatch:
+   - Deletes exactly one file at route.root + relative_path, using
+     the same relative-path computation, is_safe_relative_path
+     traversal check, and canonicalize-then-starts_with containment
+     check GET and POST already use.
+   - Directories are never deleted (403), regardless of filesystem
+     permissions - the spec explicitly calls out "directories where
+     deletion is not allowed" as a case to cover, so this is enforced
+     unconditionally rather than left to fs::remove_file's own
+     behavior (which would only fail on a directory with an OS
+     error, not a clean 403).
+   - Missing file -> 404. Permission error -> 403. Other filesystem
+     errors -> 500.
+   - Successful deletion -> 204 No Content (added StatusCode::NoContent).
+   - An empty or "/"-terminated relative path (i.e. DELETE targeting
+     the route root itself, not a specific file) -> 403, same
+     guard POST already applies to uploads.
+
+2. Cookie parsing (src/http/request.rs::HttpRequest::cookie).
+   Parses the Cookie request header per RFC 6265's "name=value;
+   name2=value2" format, tolerating multiple Cookie headers by
+   scanning all of them. No cookie-jar/response-side cookie type was
+   introduced; Set-Cookie headers are constructed directly as strings
+   where needed (see below), since the server only ever sends one
+   simple session cookie, not a general cookie API.
+
+3. Sessions (src/server/session.rs).
+   - SessionId: a 128-bit identifier from OS randomness
+     (libc::getrandom, the module's only unsafe block), hex-encoded
+     to 32 characters. SessionId::parse validates that exact shape
+     before trusting a client-supplied cookie value as a lookup key,
+     so a malformed or hostile Cookie header can never be mistaken
+     for a real session id.
+   - Session: id, created_at, last_accessed (both std::time::Instant),
+     and a HashMap<String, String> for application data (used here to
+     store a visit_count).
+   - SessionStore: HashMap<SessionId, Session>, owned by EventLoop -
+     confirmed single-threaded, no synchronization primitives, per
+     the spec's explicit "single server thread owns the session
+     store" guidance.
+   - Expiration: SESSION_TTL = 30 minutes since last access.
+     touch() lazily expires a session the moment it's looked up past
+     its TTL. sweep_expired() additionally does a bulk pass, called
+     from EventLoop::tick() (not a background thread) at most once
+     per SESSION_SWEEP_INTERVAL = 60 seconds, using an
+     Instant-based "time since last sweep" check so it costs nothing
+     on ticks in between.
+
+4. Wiring and the visit-counter demo (src/server/http_handler.rs).
+   Design decision (confirmed with the user): sessions needed a
+   visible feature to demonstrate, not just plumbing. Every request
+   now resolves a session before routing: looks up the
+   client's session_id cookie via SessionStore::touch, creating a new
+   session if the cookie is absent, unparseable, or expired. Every
+   request increments that session's visit_count. If a new session
+   was created, the response gets a Set-Cookie header
+   (Path=/; HttpOnly); if the session already existed, no Set-Cookie
+   is resent. A built-in path, /session-info (checked before route
+   selection, so it works regardless of configured routes), returns
+   the session id and visit count as a small JSON body - gives a
+   concrete, demoable feature for both a browser (cookie persists
+   across reloads, visible in dev tools) and curl (-c/-b cookie jar).
+
+Files changed:
+- src/http/static_files.rs — added handle_delete; added the DELETE
+  dispatch branch in handle_static_request, alongside the existing
+  POST branch.
+- src/http/response.rs — added StatusCode::NoContent (204) and
+  StatusCode::Created was already present from Phase 7.
+- src/http/request.rs — added HttpRequest::cookie and the
+  parse_cookie_pairs helper.
+- src/server/session.rs — new file: SessionId, Session, SessionStore,
+  6 unit tests.
+- src/server/mod.rs — added `pub mod session;`.
+- src/server/http_handler.rs — handle_request gained a
+  session_store parameter; added resolve_session, session_info_response,
+  the /session-info special case, and Set-Cookie attachment.
+- src/server/event_loop.rs — EventLoop now owns a SessionStore and a
+  last_session_sweep timestamp; tick() sweeps expired sessions at
+  most once per SESSION_SWEEP_INTERVAL; the handle_request call site
+  passes &mut self.sessions.
+- tests/routing_phase6.rs — updated all 9 handle_request call sites
+  to the new signature (each passes a fresh &mut SessionStore::new(),
+  since those tests don't exercise session behavior).
+- tests/delete_phase8.rs — new file, 7 tests.
+- tests/sessions_phase8.rs — new file, 5 tests.
+
+Tests added:
+tests/delete_phase8.rs (7 tests):
+- delete_removes_existing_file_and_returns_204,
+  delete_missing_file_returns_404, delete_directory_is_forbidden,
+  delete_traversal_attempt_is_forbidden, delete_root_path_is_forbidden,
+  delete_on_route_without_delete_method_returns_405,
+  get_after_delete_returns_404.
+
+tests/sessions_phase8.rs (5 tests):
+- first_request_without_cookie_gets_a_new_session,
+  request_with_valid_cookie_reuses_session_and_increments_count,
+  request_with_unknown_cookie_gets_a_fresh_session,
+  malformed_cookie_value_is_ignored_and_a_new_session_is_created,
+  sessions_are_independent_across_different_cookies.
+
+src/server/session.rs unit tests (5, bringing the lib unit test count
+from 14 to 19): create_and_touch_round_trip,
+touch_unknown_id_returns_none, generated_ids_are_unique,
+generated_id_is_32_hex_chars, sweep_expired_removes_only_stale_sessions.
+
+Tests executed:
+cargo check — clean, zero warnings.
+cargo test — 104/104 passing (19 unit, 10 config, 16 HTTP parser, 9
+HTTP response/static-file, 7 networking, 10 routing, 12 chunked-body,
+9 upload, 7 delete, 5 session tests).
+
+Manual verification against the built binary:
+- DELETE of an existing file via config.toml's /uploads route -> 204
+  No Content, file removed from disk (verified with `ls`).
+- DELETE of a missing file -> 404.
+- DELETE on the "/" route (no DELETE in its configured methods) ->
+  405, matching the existing method-restriction behavior from
+  Phase 6.
+- Session/cookie round trip using curl's cookie jar (-c/-b) against
+  /session-info on the live server: first request has no cookie ->
+  200 OK with a Set-Cookie header and visit_count=1; second and third
+  requests with the jar reused -> same session_id, visit_count 2 then
+  3, and no Set-Cookie resent once the session was already
+  recognized. Confirms the session mechanism works over real sockets,
+  not just in the direct-call test harness.
+
+Known limitations:
+- The visit-counter/session-info route is intentionally minimal - it
+  demonstrates the session mechanism working, not a real application
+  feature. Session data is a generic HashMap<String, String>, so any
+  future feature needing session state can reuse it without changing
+  SessionStore's shape.
+- /session-info is matched before route/config-based routing, so it
+  is not configurable per virtual server and bypasses method
+  restrictions (it always responds to any method, since
+  resolve_session/session_info_response run before select_route).
+  This is a deliberate, narrow special case for the demo route, not a
+  general pattern - it should not be imitated for future built-in
+  endpoints without reconsidering how it interacts with per-server
+  configuration.
+- Session cookies are not marked Secure (no TLS in this project) and
+  have no explicit Max-Age/Expires attribute - the browser will treat
+  them as session-lifetime cookies, while the server independently
+  expires the underlying session after 30 minutes of inactivity
+  server-side. This mismatch (cookie could outlive the session, or
+  vice versa if the browser is closed) is acceptable for an interview
+  project demonstrating the mechanism, but would need reconciling for
+  a production cookie-expiration story.
+- getrandom(2) is Linux-specific (already true of epoll, so this adds
+  no new platform constraint); its failure path falls back to a
+  time-derived value to keep the server available rather than
+  panicking, but this fallback is not itself cryptographically
+  secure. It is expected to be unreachable under normal operation
+  (a 16-byte getrandom call should not fail on any real Linux
+  system) and exists only so a broken sandbox can't crash the server,
+  which is consistent with the project's "never crash" requirement
+  taking priority.
+
+Audit requirements satisfied:
+- DELETE implemented for configured routes/files, handling successful
+  deletion, missing files, forbidden paths (directories, traversal),
+  and filesystem errors, with correct HTTP status codes.
+- Cookie request header parsed.
+- Set-Cookie generated with session ID, HttpOnly, and Path.
+- Sessions implemented as HashMap<SessionId, Session> owned by the
+  main server thread, with session ID, creation time, last access
+  time, and application data, matching the spec's minimum session
+  contents exactly.
+- Session expiration implemented; cleanup happens from the main event
+  loop (tick()), not a background thread.
+
+Remaining risks:
+- No live/socket-level test yet exercises DELETE racing a concurrent
+  GET or POST on the same file (e.g. delete-then-recreate ordering
+  under the single-threaded event loop) - not expected to be an issue
+  given strictly serial per-connection request processing, but worth
+  keeping in mind if Phase 12's integration suite adds concurrent
+  multi-client scenarios against shared files.
+- SessionStore has no upper bound on the number of concurrently
+  tracked sessions; a client that never returns a valid cookie could
+  accumulate many short-lived sessions between sweeps. The 60-second
+  sweep interval bounds how long expired sessions linger, but not how
+  many can exist simultaneously within their TTL window. This is a
+  reasonable simplification for an interview-scale project, but would
+  be worth revisiting under Phase 10's resource-limits review if
+  stress testing (Phase 13) shows memory growth under a
+  session-churning load.
