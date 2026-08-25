@@ -15,8 +15,23 @@ use localhost::http::{
     StatusCode,
 };
 
-use localhost::server::http_handler::handle_request;
+use localhost::server::http_handler::{
+    handle_request,
+    RequestOutcome,
+};
 use localhost::server::session::SessionStore;
+
+fn expect_response(
+    outcome: RequestOutcome,
+) -> localhost::http::HttpResponse {
+    match outcome {
+        RequestOutcome::Response(response) => response,
+
+        RequestOutcome::StartCgi { .. } => {
+            panic!("expected a direct response, got StartCgi")
+        }
+    }
+}
 
 fn request(
     path: &str,
@@ -79,13 +94,13 @@ fn first_request_without_cookie_gets_a_new_session() {
     let config = config();
     let mut sessions = SessionStore::new();
 
-    let response = handle_request(
+    let response = expect_response(handle_request(
         &config,
         &request("/session-info", None),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut sessions,
-    );
+    ));
 
     assert_eq!(response.status, StatusCode::Ok);
 
@@ -105,13 +120,13 @@ fn request_with_valid_cookie_reuses_session_and_increments_count() {
     let config = config();
     let mut sessions = SessionStore::new();
 
-    let first = handle_request(
+    let first = expect_response(handle_request(
         &config,
         &request("/session-info", None),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut sessions,
-    );
+    ));
 
     let set_cookie = set_cookie_header(&first).unwrap();
 
@@ -121,13 +136,13 @@ fn request_with_valid_cookie_reuses_session_and_increments_count() {
         .unwrap()
         .to_string();
 
-    let second = handle_request(
+    let second = expect_response(handle_request(
         &config,
         &request("/session-info", Some(&session_id)),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut sessions,
-    );
+    ));
 
     // No new session was created, so no Set-Cookie is expected again.
     assert!(set_cookie_header(&second).is_none());
@@ -141,7 +156,7 @@ fn request_with_unknown_cookie_gets_a_fresh_session() {
     let config = config();
     let mut sessions = SessionStore::new();
 
-    let response = handle_request(
+    let response = expect_response(handle_request(
         &config,
         &request(
             "/session-info",
@@ -150,7 +165,7 @@ fn request_with_unknown_cookie_gets_a_fresh_session() {
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut sessions,
-    );
+    ));
 
     let set_cookie =
         set_cookie_header(&response).expect("Set-Cookie should be present");
@@ -166,13 +181,13 @@ fn malformed_cookie_value_is_ignored_and_a_new_session_is_created() {
     let config = config();
     let mut sessions = SessionStore::new();
 
-    let response = handle_request(
+    let response = expect_response(handle_request(
         &config,
         &request("/session-info", Some("session_id=not-hex!!")),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut sessions,
-    );
+    ));
 
     assert_eq!(response.status, StatusCode::Ok);
     assert!(set_cookie_header(&response).is_some());
@@ -183,21 +198,21 @@ fn sessions_are_independent_across_different_cookies() {
     let config = config();
     let mut sessions = SessionStore::new();
 
-    let a = handle_request(
+    let a = expect_response(handle_request(
         &config,
         &request("/session-info", None),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut sessions,
-    );
+    ));
 
-    let b = handle_request(
+    let b = expect_response(handle_request(
         &config,
         &request("/session-info", None),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut sessions,
-    );
+    ));
 
     let cookie_a = set_cookie_header(&a).unwrap();
     let cookie_b = set_cookie_header(&b).unwrap();

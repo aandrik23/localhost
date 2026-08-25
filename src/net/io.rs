@@ -1,7 +1,12 @@
-//! Single non-blocking client I/O operations.
+//! Single non-blocking I/O operations.
 //!
 //! The event loop calls read_once or write_once at most once for each
 //! readiness event. Neither function contains an internal retry loop.
+//!
+//! read_once/write_once operate on TcpStream (client sockets).
+//! read_fd_once/write_fd_once operate on a raw file descriptor and
+//! exist for CGI pipes, which are not sockets and have no Rust
+//! standard-library wrapper with the same Read/Write ergonomics.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -71,6 +76,83 @@ pub fn write_once(
         }
 
         Err(err) => Err(err),
+    }
+}
+
+/// Performs one read attempt only, on a raw non-blocking file
+/// descriptor (used for CGI stdout pipes).
+///
+/// The fd must already be set O_NONBLOCK by the caller; this
+/// function does not set it. The single unsafe block wraps the
+/// read(2) syscall itself - its safety invariant is that `fd` is a
+/// valid, open, readable file descriptor for the duration of the
+/// call, and `buf` is a valid buffer of at least `buf.len()` bytes,
+/// both guaranteed by the caller owning the fd and passing a real
+/// Rust slice.
+#[cfg(unix)]
+pub fn read_fd_once(
+    fd: std::os::fd::RawFd,
+    buf: &mut [u8],
+) -> io::Result<ReadOutcome> {
+    if buf.is_empty() {
+        return Ok(ReadOutcome::WouldBlock);
+    }
+
+    let result = unsafe {
+        libc::read(
+            fd,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+
+    if result == 0 {
+        return Ok(ReadOutcome::Closed);
+    }
+
+    if result > 0 {
+        return Ok(ReadOutcome::Read(result as usize));
+    }
+
+    let err = io::Error::last_os_error();
+
+    match err.kind() {
+        io::ErrorKind::WouldBlock => Ok(ReadOutcome::WouldBlock),
+        io::ErrorKind::Interrupted => Ok(ReadOutcome::Interrupted),
+        _ => Err(err),
+    }
+}
+
+/// Performs one write attempt only, on a raw non-blocking file
+/// descriptor (used for CGI stdin pipes). Same safety invariant as
+/// read_fd_once.
+#[cfg(unix)]
+pub fn write_fd_once(
+    fd: std::os::fd::RawFd,
+    buf: &[u8],
+) -> io::Result<WriteOutcome> {
+    if buf.is_empty() {
+        return Ok(WriteOutcome::Written(0));
+    }
+
+    let result = unsafe {
+        libc::write(
+            fd,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
+        )
+    };
+
+    if result > 0 {
+        return Ok(WriteOutcome::Written(result as usize));
+    }
+
+    let err = io::Error::last_os_error();
+
+    match err.kind() {
+        io::ErrorKind::WouldBlock => Ok(WriteOutcome::WouldBlock),
+        io::ErrorKind::Interrupted => Ok(WriteOutcome::Interrupted),
+        _ => Err(err),
     }
 }
 

@@ -11,12 +11,28 @@ use localhost::config::{
 };
 
 use localhost::http::{
-    handle_static_request,
+    resolve_route,
     HttpRequest,
+    HttpResponse,
     HttpVersion,
     Method,
+    RouteOutcome,
     StatusCode,
 };
+
+fn handle_static_request(
+    request: &HttpRequest,
+    server: &ServerConfig,
+    route: &RouteConfig,
+) -> HttpResponse {
+    match resolve_route(request, server, route) {
+        RouteOutcome::Response(response) => response,
+
+        RouteOutcome::Cgi { .. } => {
+            panic!("expected a direct response, got Cgi")
+        }
+    }
+}
 
 fn temporary_directory() -> std::path::PathBuf {
     let unique = SystemTime::now()

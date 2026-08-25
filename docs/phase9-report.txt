@@ -1,0 +1,397 @@
+Phase 9 Report — CGI
+
+Phase:
+Phase 9 — CGI.
+
+Implemented:
+
+Full non-blocking CGI execution, chosen deliberately over a simpler
+std::process::Command::wait()-based approach after discussing the
+tradeoff with the user: a blocking wait() would freeze the entire
+single-threaded event loop - and therefore every other client - for
+the whole runtime of any CGI script, which is a direct violation of
+this phase's explicit requirement ("the server must be able to
+continue servicing other clients while a CGI process is running").
+This was confirmed as a real, demonstrable difference (not just a
+technicality) before implementation began.
+
+1. Process spawning (src/net/process.rs, Unix-only, new module).
+   The only file in the codebase calling fork(2) and execve-family
+   functions. spawn_cgi():
+   - Creates two pipes (stdin, stdout) before forking.
+   - In the child: dup2's the pipe ends onto fd 0/1, closes the
+     originals, chdir's into the script's own directory (per spec:
+     "pay attention to the directory where the CGI will run"), then
+     calls execvpe(executable, argv, envp). Only async-signal-safe
+     operations occur between fork() and exec() in the child
+     (dup2/close/chdir/execve); on exec failure the child calls
+     _exit(127) directly rather than unwinding through any normal
+     Rust exit path.
+   - In the parent: closes the pipe ends it doesn't need, and sets
+     O_NONBLOCK on its own stdin-write/stdout-read fds via fcntl.
+   - execvpe (not execve) was used after an initial smoke test with
+     execve failed with exit code 127 - execve requires an absolute
+     or CWD-relative path and does not search PATH, so "python3"
+     alone cannot work with it. execvpe searches PATH like execvp,
+     while also letting the exact CGI environment be set rather than
+     inherited from the server process.
+   - try_wait()/kill_process() wrap waitpid(WNOHANG) and kill(SIGKILL)
+     respectively; every waitpid call in this codebase uses WNOHANG,
+     never a blocking wait.
+
+2. Raw-fd non-blocking I/O (src/net/io.rs).
+   Added read_fd_once/write_fd_once, parallel to the existing
+   read_once/write_once but operating on a raw file descriptor
+   instead of TcpStream (CGI pipes aren't sockets and have no
+   std::net wrapper). Each performs exactly one read(2)/write(2)
+   syscall, no internal retry loop, matching every other I/O
+   primitive in the project.
+
+3. CGI process/environment construction (src/server/cgi.rs, new
+   module, Unix-only).
+   CgiProcess holds pid, stdin/stdout fds, a state marker, the
+   request body buffer plus how much of it has been written so far,
+   accumulated output, and a start Instant for timeout checking.
+   build_cgi_env() constructs the full CGI environment: GATEWAY_INTERFACE,
+   SERVER_PROTOCOL, SERVER_SOFTWARE, SERVER_NAME, SERVER_PORT,
+   REQUEST_METHOD, SCRIPT_NAME, PATH_INFO, QUERY_STRING,
+   CONTENT_LENGTH, CONTENT_TYPE, REMOTE_ADDR, one HTTP_<HEADER> per
+   request header, and PATH (needed for execvpe's own PATH search to
+   find the interpreter, independent of what the CGI script itself
+   needs PATH for).
+
+4. Extension-to-script matching with PATH_INFO support
+   (src/http/static_files.rs::cgi_executable_for).
+   A real bug was found and fixed here during testing: the first
+   implementation checked only the final path segment's extension
+   (Path::extension() looks at the last component only), which broke
+   PATH_INFO-style requests like "/cgi/script.py/extra/segments" -
+   the extension of "segments" is nothing, so the request silently
+   fell through to static file handling instead of running CGI.
+   Fixed by scanning path segments left-to-right for the first one
+   whose extension matches a configured CGI mapping, returning both
+   the executable and the relative path up to (and including) that
+   segment; anything after it becomes PATH_INFO.
+
+5. Route resolution split (src/http/static_files.rs::RouteOutcome,
+   resolve_route). handle_static_request was previously the single
+   entry point for GET/POST/DELETE; CGI cannot fit that shape because
+   spawning a process and registering pipe fds with epoll requires
+   access the http module doesn't have (event loop bookkeeping).
+   resolve_route now runs the method/body-limit/redirect checks
+   common to every route type, then either dispatches to CGI
+   (returning RouteOutcome::Cgi{executable, script_path}, with the
+   script path already canonicalized and root-contained using the
+   exact same safety check GET/POST/DELETE use) or continues to the
+   renamed, now-private handle_static_request for the filesystem
+   case.
+
+6. Event loop integration (src/server/event_loop.rs).
+   - RequestOutcome (in http_handler.rs) replaces the old plain
+     HttpResponse return type from handle_request: either a direct
+     Response, or StartCgi carrying the executable, script path,
+     route path, a resolved ServerConfig snapshot (needed for this
+     CGI request's own error responses once routing's borrow has
+     ended), and any Set-Cookie header that must be attached once
+     the CGI eventually completes.
+   - CgiMeta { process, server, set_cookie } is tracked in a new
+     cgi_processes: HashMap<SocketId, CgiMeta>, keyed by the CGI's
+     stdout fd - registered with epoll exactly like a listener or
+     client socket. A second small map, cgi_stdin_to_stdout, lets a
+     writable event on the stdin pipe find its CgiMeta.
+   - Connection gained an awaiting_cgi flag. Requests are processed
+     strictly serially per connection already; when a request
+     resolves to CGI, any later requests already parsed in the same
+     read's batch are pushed back onto the front of the connection's
+     queue (preserving order) and are not dispatched again until the
+     CGI response has been sent - this keeps HTTP/1.1 response
+     ordering correct on a persistent connection with a CGI request
+     in the middle.
+   - tick()'s dispatch loop now checks cgi_processes and
+     cgi_stdin_to_stdout before falling through to the existing
+     listener/connection checks. handle_cgi_stdout_readable performs
+     exactly one read per event (accumulating into CgiProcess::output,
+     finalizing on EOF); handle_cgi_stdin_writable performs exactly
+     one write per event (closing stdin once the whole body has been
+     written, so the child sees EOF).
+   - sweep_cgi_timeouts() (called once per tick()) kills and
+     finalizes any CGI process whose CGI_TIMEOUT (10s, fixed) has
+     elapsed.
+   - build_cgi_response() parses a CGI script's raw stdout into an
+     HttpResponse: a CRLF-or-LF-terminated header block (at minimum
+     Content-Type) followed by a blank line and the body. Output with
+     no discoverable separator, or without Content-Type, is treated
+     as malformed and produces a 500, per the spec's explicit failure
+     case for "malformed CGI response."
+
+Bugs found and fixed during this phase's own testing (all three were
+real defects caught by writing and running tests against a live
+EventLoop, not by inspection):
+
+1. Zombie processes / busy-wait on reap. The first version of
+   finish_cgi looped up to 50 times calling
+   std::thread::yield_now() hoping a just-killed child would become
+   reapable - yield_now() does not wait on real time, so the loop
+   could exhaust itself before the kernel finished tearing the
+   process down, leaving a zombie, and the loop itself was a form of
+   blocking inside request handling. Reproduced live with `ps`
+   showing a `<defunct>` python3 process after a timed-out CGI
+   request. Fixed (per explicit discussion with the user) by
+   deferring reaping entirely: finish_cgi does one non-blocking
+   try_wait() and, if the child isn't reapable yet, queues its pid in
+   a new pending_reap list; sweep_pending_reaps() retries each queued
+   pid with one non-blocking waitpid(WNOHANG) per tick() until it
+   succeeds. remove_connection's own orphaned-CGI cleanup path had
+   the identical gap (kill but never reap) and was fixed the same
+   way. tick()'s epoll_wait timeout is now capped (to 1 second) while
+   any CGI process is running or any pid is pending reap, since an
+   idle CGI child (e.g. sleeping, writing nothing) never signals
+   epoll on its own and an unbounded wait would let both a timeout
+   and a pending reap go unchecked indefinitely on an otherwise idle
+   server.
+
+2. PATH_INFO requests silently skipped CGI. Described in item 4
+   above - cgi_executable_for only checked the last path segment's
+   extension, so "/cgi/script.py/extra/segments" fell through to
+   static file handling (attempting to serve a nonexistent
+   "extra/segments" file, or worse, the raw script as a static file
+   if it happened to exist at that literal path) instead of running
+   the script. Caught by a dedicated PATH_INFO test
+   (path_info_reaches_cgi_environment) that failed until fixed.
+
+3. Double-close file-descriptor abort. close_cgi_stdin removed the
+   stdin fd from cgi_stdin_to_stdout before using that same
+   (now-empty) lookup to find and clear CgiProcess::stdin_fd, so the
+   clear never actually happened - CgiProcess kept believing stdin
+   was still open. finish_cgi later saw Some(stdin_fd) and closed it
+   again, and Rust's stdlib IO-safety checks detected the double
+   close and aborted the whole test process with SIGABRT ("owned
+   file descriptor already closed"). Fixed by capturing the map's
+   removed value directly (HashMap::remove returns it) instead of
+   trying to look it up afterward. Caught by
+   slow_cgi_does_not_block_a_concurrent_client, which was the only
+   test exercising a request with a real (non-empty, in this case
+   empty-but-still-going-through-the-write-path) stdin write cycle
+   under concurrent load.
+
+Files changed:
+- src/net/process.rs — new file: spawn_cgi, try_wait, kill_process.
+- src/net/io.rs — added read_fd_once/write_fd_once.
+- src/net/mod.rs — added `#[cfg(unix)] pub mod process;`.
+- src/server/cgi.rs — new file: CgiProcess, CgiState, start_cgi,
+  stop_cgi, build_cgi_env, CGI_TIMEOUT.
+- src/server/mod.rs — added `#[cfg(unix)] pub mod cgi;`.
+- src/server/connection.rs — added Connection::awaiting_cgi.
+- src/http/static_files.rs — added RouteOutcome, resolve_route,
+  cgi_executable_for, resolve_cgi_script; handle_static_request is
+  now a private continuation taking pre-resolved root/relative_path.
+- src/http/mod.rs — exports resolve_route/RouteOutcome in place of
+  the old handle_static_request.
+- src/http/response.rs — added StatusCode::Created (already present
+  from Phase 7) — no change needed here beyond what Phase 7 added.
+- src/server/http_handler.rs — added RequestOutcome,
+  handle_request now returns it instead of a bare HttpResponse.
+- src/server/event_loop.rs — CgiMeta, cgi_processes,
+  cgi_stdin_to_stdout, pending_reap; spawn_cgi_for_connection,
+  handle_cgi_stdout_readable, handle_cgi_stdin_writable,
+  close_cgi_stdin, sweep_cgi_timeouts, sweep_pending_reaps,
+  finish_cgi, build_cgi_response, queue_response_now,
+  with_optional_cookie; tick()'s dispatch loop and epoll_wait timeout
+  logic updated for CGI fds; remove_connection cleans up orphaned CGI
+  processes (and now reaps or defers them, per bug fix #1).
+- tests/routing_phase6.rs, tests/sessions_phase8.rs — updated for
+  handle_request's new RequestOutcome return type.
+- tests/http_response_phase5.rs, tests/uploads_phase7.rs,
+  tests/delete_phase8.rs — added a local handle_static_request shim
+  calling resolve_route + unwrapping RouteOutcome::Response, so the
+  bulk of each file's existing test bodies needed no changes.
+- tests/cgi_phase9.rs — new file, 8 tests.
+
+Tests added (tests/cgi_phase9.rs, all driving a real EventLoop over
+real TCP sockets with a real forked python3 child):
+- get_request_runs_cgi_and_returns_output
+- post_body_is_delivered_to_cgi_stdin
+- query_string_reaches_cgi_environment
+- path_info_reaches_cgi_environment
+- cgi_script_exiting_nonzero_with_no_output_returns_500
+- malformed_cgi_output_without_headers_returns_500
+- missing_cgi_script_returns_404
+- slow_cgi_does_not_block_a_concurrent_client (the load-bearing test
+  for this phase's core requirement: asserts a concurrent, unrelated
+  request completes in well under 500ms while a 1-second CGI script
+  is still running)
+- pipelined_request_after_cgi_is_still_answered (added during the
+  fresh-context review pass, covers bug fix #4 above)
+- cgi_script_nonzero_exit_with_valid_output_is_still_returned (added
+  during the fresh-context review pass, covers bug fix #5 above)
+
+Tests executed:
+cargo check — clean, zero warnings.
+cargo test — 114/114 passing (19 unit, 10 CGI, 12 chunked-body, 10
+config, 7 delete, 16 HTTP parser, 9 HTTP response/static-file, 7
+networking, 10 routing, 5 session, 9 upload tests).
+
+Manual verification against the built binary, using config.toml's
+existing /cgi route (.py -> python3):
+- GET /cgi/hello.py?foo=bar with no body -> 200, correct
+  REQUEST_METHOD/PATH_INFO/QUERY_STRING/CONTENT_LENGTH in the
+  script's own environment dump.
+- POST /cgi/hello.py with a body -> 200, body correctly delivered
+  through the non-blocking stdin pipe and echoed back by the script.
+- Concurrency proof: a 2-second sleeping CGI script started in the
+  background, then a static file request issued 300ms later -
+  measured with `time`, the static request completed in 0.007s while
+  the slow CGI request was still in flight (it took the full 2.026s),
+  demonstrating the server is not blocked by a running CGI process.
+- Timeout proof: a script sleeping 30s against CGI_TIMEOUT=10s ->
+  the server delivered a 500 Internal Server Error at 10.043s
+  elapsed (curl's own --max-time was set higher, so this is the
+  server's own timeout firing, not curl giving up).
+- Zombie proof: `ps --ppid <server_pid>` immediately after a
+  timed-out request, and again 2 seconds later, showed no
+  <defunct>/Z-state process in either check (this was run against the
+  build containing all three bug fixes above; the pre-fix build
+  reproducibly left a zombie in the same scenario).
+
+Known limitations:
+- CGI_TIMEOUT (10 seconds) is a fixed constant, not configurable per
+  route or server. The spec only requires that a timeout exist and
+  be enforced without blocking the event loop, which this satisfies;
+  making it configurable would be a reasonable Phase 10 follow-up
+  (that phase explicitly covers "CGI processes" under timeouts and
+  resource limits) rather than something to add here.
+- Only one CGI extension mapping is exercised in this project's own
+  config.toml/tests (.py -> python3), matching the spec's "implement
+  only one CGI of your choice" — the mechanism itself
+  (route.cgi: HashMap<String, String>) already supports multiple
+  extensions per route without any further code changes.
+- There is no explicit cap on the number of concurrently running CGI
+  processes; a client issuing many concurrent CGI requests could
+  spawn many child processes at once. This mirrors SessionStore's
+  similar known limitation from Phase 8 and is flagged for the same
+  reason: worth revisiting under Phase 10's resource-limits review if
+  Phase 13's stress testing shows it matters in practice.
+- build_cgi_response's header/body separator search treats a bare
+  "\n\n" and a full "\r\n\r\n" as the only two valid separators. A
+  CGI script mixing line-ending styles within its own header block
+  (unlikely in practice, since scripts typically use one language's
+  native print/newline convention throughout) could produce a
+  response this parser doesn't recognize as well-formed, in which
+  case it correctly falls back to 500 rather than misparsing.
+
+Audit requirements satisfied:
+- CGI executes as a child process (fork + exec, never
+  std::process::Command's blocking wait()).
+- CGI receives the file to process as its first argument (argv[1] in
+  spawn_cgi, alongside argv[0] = the executable name).
+- CGI receives EOF after the request body (stdin is closed once the
+  full body has been written, whether that's immediately for an
+  empty body or after the non-blocking write loop finishes for a
+  non-empty one).
+- CGI receives PATH_INFO, and PATH_INFO-style extra path segments are
+  now correctly recognized as still belonging to the mapped script
+  (bug fix #2).
+- CGI executes from the correct working directory (chdir to the
+  script's own parent directory before exec).
+- CGI receives the standard CGI environment variables plus one
+  HTTP_<NAME> per request header.
+- CGI execution does not block the main event loop - proven live,
+  not just architected that way (the concurrency test and the manual
+  `time`-measured proof above).
+- Failure cases handled: missing executable/script (404, verified),
+  fork/exec failure (500, via spawn_cgi_for_connection's error path),
+  abnormal exit (500, verified with a script that exits(1) with no
+  output), CGI timeout (500, verified with real elapsed-time
+  measurement), malformed CGI response (500, verified), and (via bug
+  fixes #1 and #3) no zombie processes and no double-close aborts
+  under either the timeout path or the concurrent-load path.
+
+Fresh-context review and two more bugs found and fixed:
+
+Per AGENT.md's "review after each major phase" rule, this phase's
+event-loop/CGI code was reviewed in a fresh context after the three
+bugs above were fixed. The review surfaced two further real,
+independently-confirmed correctness bugs (both fixed and covered by
+new tests before this report was finalized), plus a set of lower-
+priority reuse/simplification/altitude observations (duplicated
+helpers, a dead CgiState enum, the fd-kind dispatch chain in tick())
+that were not acted on this session - noted below as still-open
+follow-ups rather than defects.
+
+4. Pipelined requests stall permanently behind a completed CGI
+   response. Previously, `connection.requests` was only ever drained
+   from inside handle_client_readable (triggered by a socket-readable
+   epoll event). When a request resolved to CGI, any later requests
+   already parsed in the same batch were correctly pushed back onto
+   the front of the queue to preserve ordering - but nothing
+   re-drained that queue once the CGI response was actually sent.
+   finish_cgi cleared awaiting_cgi and queued the CGI's own response,
+   but never looked at whatever was still waiting behind it. A real
+   HTTP/1.1 pipelining client that sends multiple requests in one
+   write and then waits for all the responses (valid, spec-permitted
+   behavior) would have its second-and-later requests hang forever,
+   since it has no obligation to send more bytes first. Fixed by
+   extracting the request-dispatch loop (previously inline in
+   handle_client_readable) into a shared EventLoop::process_queued_requests,
+   now called both from handle_client_readable after a read and from
+   finish_cgi after a CGI response has been queued - so anything left
+   in the queue is processed immediately, not only on the next socket
+   event. Covered by the new pipelined_request_after_cgi_is_still_answered
+   test, which pipelines a CGI request and a static request in one
+   write, sends nothing further, and asserts both responses arrive.
+
+5. A CGI script's valid output was discarded whenever it exited with
+   a non-zero status. CGI/1.1 has no notion of "exit code as HTTP
+   status" - a script signals anything other than plain success via
+   a Status: header in its own output, not its process exit code.
+   finish_cgi was unconditionally treating any non-zero exit as a
+   hard failure and replacing whatever the script had already written
+   to stdout with a bare 500, even when that output was a
+   well-formed, parseable CGI response. Fixed so a non-zero exit only
+   forces a 500 when there is no output to fall back on at all
+   (matching the pre-existing, still-correct behavior for a script
+   that exits non-zero with empty output); otherwise the captured
+   output is parsed and returned normally via build_cgi_response, the
+   same as a clean exit. Covered by the new
+   cgi_script_nonzero_exit_with_valid_output_is_still_returned test.
+
+Both of these were found via a fresh-context review pass, not by the
+tests that existed before the review (matching the same pattern as
+bugs #1-3 above: the review methodology this project relies on is
+"write integration tests through the real EventLoop, then have a
+second pass specifically hunt for what those tests didn't happen to
+exercise").
+
+Remaining risks:
+- Lower-priority findings from the same review pass were not acted on
+  this session and remain open follow-ups, not defects: with_optional_cookie
+  is defined identically in both event_loop.rs and http_handler.rs
+  rather than shared (a future divergence risk, not a current bug);
+  CgiState (WritingStdin/ReadingStdout) is defined on CgiProcess but
+  never read anywhere - the real state is tracked implicitly via
+  stdin_fd/awaiting_cgi - and should either be wired up as the single
+  source of truth or deleted; the canonicalize+contains-root
+  traversal-safety check is duplicated between resolve_cgi_script and
+  the static-file path in the same file rather than factored into one
+  helper; tick()'s dispatch loop checks four separate HashMaps
+  (listeners, connections, cgi_processes, cgi_stdin_to_stdout) via a
+  chained contains_key/continue ladder rather than one unified
+  fd-kind lookup; build_cgi_response (pure protocol-shape parsing)
+  lives in event_loop.rs alongside epoll/fork mechanics rather than
+  in src/http/ next to parser.rs/response.rs, which is where the
+  project's existing module boundaries would suggest it belongs.
+- No test exercises multiple concurrent CGI processes on distinct
+  connections simultaneously (only one CGI request plus one unrelated
+  static request were raced against each other). The underlying data
+  structures (HashMap<SocketId, CgiMeta>, keyed by each process's own
+  stdout fd) should handle this correctly since fds are unique per
+  process, but it has not been explicitly verified.
+- A CGI request whose client disconnects mid-flight is cleaned up by
+  a separate code path in remove_connection (deregister/close both
+  pipe fds, kill the process, defer reaping) that duplicates
+  finish_cgi's equivalent teardown sequence rather than sharing it.
+  The two are currently kept in sync by hand; a future change to one
+  (e.g. adding a third pipe for CGI stderr) would need the same
+  change applied to the other, and that path is comparatively
+  under-tested (no test currently disconnects a client while its CGI
+  is still running).

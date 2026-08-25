@@ -18,25 +18,48 @@ use crate::http::{
     StatusCode,
 };
 
-/// Handles a request against an already-selected route.
+/// What a route resolves to once its method/body-limit/redirect
+/// guards have passed.
+pub enum RouteOutcome {
+    /// A complete, immediately-sendable HTTP response - the normal
+    /// case for GET/POST/DELETE against static files.
+    Response(HttpResponse),
+
+    /// The request matched a CGI extension mapping and passed every
+    /// filesystem-safety check a static request would; `script_path`
+    /// is the canonicalized, root-contained path to the script.
+    /// Execution itself is the caller's responsibility (see
+    /// server::cgi and server::event_loop) because it involves
+    /// forking a process and registering pipe fds with the event
+    /// loop, neither of which this module has access to.
+    Cgi {
+        executable: String,
+        script_path: PathBuf,
+    },
+}
+
+/// Resolves a request against an already-selected route: enforces
+/// allowed methods, the server's body-size limit, and redirects,
+/// then dispatches to either CGI or static file handling.
 ///
 /// Route selection (which route matches `request.path`) and virtual
 /// server selection happen before this function is called; see
-/// `server::routing`. This function only enforces the route's allowed
-/// methods, resolves redirects, and serves from the filesystem.
-pub fn handle_static_request(
+/// `server::routing`.
+pub fn resolve_route(
     request: &HttpRequest,
     server: &ServerConfig,
     route: &RouteConfig,
-) -> HttpResponse {
+) -> RouteOutcome {
     if !method_allowed(route, &request.method) {
-        return error_response(
-            server,
-            StatusCode::MethodNotAllowed,
-        )
-        .with_header(
-            "Allow",
-            allow_header_value(route),
+        return RouteOutcome::Response(
+            error_response(
+                server,
+                StatusCode::MethodNotAllowed,
+            )
+            .with_header(
+                "Allow",
+                allow_header_value(route),
+            ),
         );
     }
 
@@ -48,10 +71,10 @@ pub fn handle_static_request(
      * its own (possibly smaller) limit.
      */
     if request.body.len() > server.client_max_body_size {
-        return error_response(
+        return RouteOutcome::Response(error_response(
             server,
             StatusCode::PayloadTooLarge,
-        );
+        ));
     }
 
     if let Some(location) = &route.redirect {
@@ -59,13 +82,15 @@ pub fn handle_static_request(
             route.redirect_status.unwrap_or(302),
         );
 
-        return HttpResponse::new(
-            status,
-            Vec::new(),
-        )
-        .with_header(
-            "Location",
-            location.clone(),
+        return RouteOutcome::Response(
+            HttpResponse::new(
+                status,
+                Vec::new(),
+            )
+            .with_header(
+                "Location",
+                location.clone(),
+            ),
         );
     }
 
@@ -74,10 +99,10 @@ pub fn handle_static_request(
             Some(root) => PathBuf::from(root),
 
             None => {
-                return error_response(
+                return RouteOutcome::Response(error_response(
                     server,
                     StatusCode::InternalServerError,
-                );
+                ));
             }
         };
 
@@ -89,17 +114,158 @@ pub fn handle_static_request(
             .trim_start_matches('/');
 
     if !is_safe_relative_path(relative_path) {
-        return error_response(
+        return RouteOutcome::Response(error_response(
             server,
             StatusCode::Forbidden,
+        ));
+    }
+
+    if let Some((executable, script_relative_path)) =
+        cgi_executable_for(route, relative_path)
+    {
+        return resolve_cgi_script(
+            server,
+            &root,
+            script_relative_path,
+            executable,
         );
     }
 
+    RouteOutcome::Response(handle_static_request(
+        request,
+        server,
+        route,
+        &root,
+        relative_path,
+    ))
+}
+
+/// Finds a CGI mapping within `relative_path`, scanning from the
+/// first segment. This handles PATH_INFO-style requests like
+/// "/script.py/extra/segments", where only "script.py" (not the
+/// trailing segments) is the actual file to execute - checking only
+/// the final path segment's extension would miss this, since
+/// Path::extension() looks at the last component only.
+///
+/// Returns the matched executable and the relative path up to and
+/// including the script itself (excluding any trailing PATH_INFO
+/// segments); the caller computes PATH_INFO itself from the full
+/// request path, so only the script's own location is needed here.
+fn cgi_executable_for<'a, 'b>(
+    route: &'a RouteConfig,
+    relative_path: &'b str,
+) -> Option<(&'a str, &'b str)> {
+    let mut consumed_len = 0;
+
+    for segment in relative_path.split('/') {
+        consumed_len += segment.len();
+
+        if let Some(extension) =
+            Path::new(segment)
+                .extension()
+                .and_then(|ext| ext.to_str())
+        {
+            if let Some(executable) =
+                route.cgi.get(&format!(".{}", extension))
+            {
+                return Some((
+                    executable.as_str(),
+                    &relative_path[..consumed_len],
+                ));
+            }
+        }
+
+        // Account for the '/' separator consumed by split, except
+        // after the last segment.
+        consumed_len += 1;
+    }
+
+    None
+}
+
+/// Resolves and safety-checks the CGI script path, reusing the exact
+/// same canonicalize-then-contain check GET/POST/DELETE already use,
+/// so a CGI request can no more escape the route root than a static
+/// one can.
+fn resolve_cgi_script(
+    server: &ServerConfig,
+    root: &Path,
+    relative_path: &str,
+    executable: &str,
+) -> RouteOutcome {
+    let requested_path = root.join(relative_path);
+
+    let canonical_root =
+        match fs::canonicalize(root) {
+            Ok(path) => path,
+
+            Err(_) => {
+                return RouteOutcome::Response(error_response(
+                    server,
+                    StatusCode::InternalServerError,
+                ));
+            }
+        };
+
+    let canonical_script =
+        match fs::canonicalize(&requested_path) {
+            Ok(path) => path,
+
+            Err(err) => {
+                let status = match err.kind() {
+                    io::ErrorKind::NotFound => {
+                        StatusCode::NotFound
+                    }
+
+                    io::ErrorKind::PermissionDenied => {
+                        StatusCode::Forbidden
+                    }
+
+                    _ => StatusCode::InternalServerError,
+                };
+
+                return RouteOutcome::Response(error_response(
+                    server, status,
+                ));
+            }
+        };
+
+    if !canonical_script.starts_with(&canonical_root) {
+        return RouteOutcome::Response(error_response(
+            server,
+            StatusCode::Forbidden,
+        ));
+    }
+
+    if !canonical_script.is_file() {
+        return RouteOutcome::Response(error_response(
+            server,
+            StatusCode::NotFound,
+        ));
+    }
+
+    RouteOutcome::Cgi {
+        executable: executable.to_string(),
+        script_path: canonical_script,
+    }
+}
+
+/// Handles GET/POST/DELETE against the filesystem for a route that
+/// did not resolve to CGI. `root` and `relative_path` are passed in
+/// already computed by resolve_route so the CGI-vs-static branch
+/// point stays in one place.
+fn handle_static_request(
+    request: &HttpRequest,
+    server: &ServerConfig,
+    route: &RouteConfig,
+    root: &Path,
+    relative_path: &str,
+) -> HttpResponse {
     if request.method == Method::Post {
         return handle_upload(
             request,
             server,
-            &root,
+            root,
             relative_path,
         );
     }
@@ -107,7 +273,7 @@ pub fn handle_static_request(
     if request.method == Method::Delete {
         return handle_delete(
             server,
-            &root,
+            root,
             relative_path,
         );
     }
@@ -159,7 +325,7 @@ pub fn handle_static_request(
     }
 
     let canonical_root =
-        match fs::canonicalize(&root) {
+        match fs::canonicalize(root) {
             Ok(path) => path,
 
             Err(_) => {

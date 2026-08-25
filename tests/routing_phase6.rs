@@ -14,17 +14,31 @@ use localhost::config::{
 
 use localhost::http::{
     HttpRequest,
+    HttpResponse,
     HttpVersion,
     Method,
     StatusCode,
 };
 
-use localhost::server::http_handler::handle_request;
+use localhost::server::http_handler::{
+    handle_request,
+    RequestOutcome,
+};
 use localhost::server::routing::{
     select_route,
     select_server,
 };
 use localhost::server::session::SessionStore;
+
+fn expect_response(outcome: RequestOutcome) -> HttpResponse {
+    match outcome {
+        RequestOutcome::Response(response) => response,
+
+        RequestOutcome::StartCgi { .. } => {
+            panic!("expected a direct response, got StartCgi")
+        }
+    }
+}
 
 fn temporary_directory() -> std::path::PathBuf {
     let unique = SystemTime::now()
@@ -120,13 +134,13 @@ fn selects_virtual_server_by_host_header() {
         ],
     };
 
-    let response = handle_request(
+    let response = expect_response(handle_request(
         &config,
         &request_with_host(Method::Get, "/", Some("b.test")),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut SessionStore::new(),
-    );
+    ));
 
     assert_eq!(response.status, StatusCode::Ok);
     assert_eq!(response.body, b"site B");
@@ -158,13 +172,13 @@ fn unmatched_host_falls_back_to_default_server() {
         ],
     };
 
-    let response = handle_request(
+    let response = expect_response(handle_request(
         &config,
         &request_with_host(Method::Get, "/", Some("unknown.test")),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut SessionStore::new(),
-    );
+    ));
 
     assert_eq!(response.status, StatusCode::Ok);
     assert_eq!(response.body, b"default site");
@@ -196,13 +210,13 @@ fn different_ports_select_different_servers() {
         ],
     };
 
-    let response = handle_request(
+    let response = expect_response(handle_request(
         &config,
         &request_with_host(Method::Get, "/", None),
         Ipv4Addr::new(127, 0, 0, 1),
         9090,
         &mut SessionStore::new(),
-    );
+    ));
 
     assert_eq!(response.status, StatusCode::Ok);
     assert_eq!(response.body, b"port 9090");
@@ -225,13 +239,13 @@ fn route_with_no_configured_methods_denies_all() {
         )],
     };
 
-    let response = handle_request(
+    let response = expect_response(handle_request(
         &config,
         &request_with_host(Method::Get, "/", Some("a.test")),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut SessionStore::new(),
-    );
+    ));
 
     assert_eq!(response.status, StatusCode::MethodNotAllowed);
 
@@ -252,13 +266,13 @@ fn method_not_allowed_includes_allow_header() {
         )],
     };
 
-    let response = handle_request(
+    let response = expect_response(handle_request(
         &config,
         &request_with_host(Method::Delete, "/", Some("a.test")),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut SessionStore::new(),
-    );
+    ));
 
     assert_eq!(response.status, StatusCode::MethodNotAllowed);
 
@@ -294,13 +308,13 @@ fn redirect_route_returns_302_and_location() {
         )],
     };
 
-    let response = handle_request(
+    let response = expect_response(handle_request(
         &config,
         &request_with_host(Method::Get, "/old", Some("a.test")),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut SessionStore::new(),
-    );
+    ));
 
     assert_eq!(response.status.code(), 302);
 
@@ -333,13 +347,13 @@ fn redirect_route_honors_configured_status() {
         )],
     };
 
-    let response = handle_request(
+    let response = expect_response(handle_request(
         &config,
         &request_with_host(Method::Get, "/old", Some("a.test")),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut SessionStore::new(),
-    );
+    ));
 
     assert_eq!(response.status.code(), 301);
 }
@@ -363,13 +377,13 @@ fn longest_matching_route_wins_over_root() {
         )],
     };
 
-    let response = handle_request(
+    let response = expect_response(handle_request(
         &config,
         &request_with_host(Method::Get, "/uploads/", Some("a.test")),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut SessionStore::new(),
-    );
+    ));
 
     assert_eq!(response.status, StatusCode::Ok);
     assert_eq!(response.body, b"uploads page");
@@ -384,13 +398,13 @@ fn no_matching_route_returns_404() {
         servers: vec![server(&["a.test"], vec![8080], vec![])],
     };
 
-    let response = handle_request(
+    let response = expect_response(handle_request(
         &config,
         &request_with_host(Method::Get, "/anything", Some("a.test")),
         Ipv4Addr::new(127, 0, 0, 1),
         8080,
         &mut SessionStore::new(),
-    );
+    ));
 
     assert_eq!(response.status, StatusCode::NotFound);
 }

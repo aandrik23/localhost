@@ -28,5 +28,6 @@ pub use response::{
 pub use static_files::{
     default_error_response,
     error_response,
-    handle_static_request,
+    resolve_route,
+    RouteOutcome,
 };

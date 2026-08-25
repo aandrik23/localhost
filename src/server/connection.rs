@@ -49,6 +49,16 @@ pub struct Connection {
     pub close_after_write: bool,
 
     pub last_activity: Instant,
+
+    /*
+     * Set while a CGI process spawned for this connection's current
+     * request is still running. Requests are processed strictly
+     * serially per connection (per the project's HTTP/1.1 model), so
+     * while this is true, no further buffered requests are
+     * dispatched - the CGI's eventual response must be sent before
+     * any request that came after it.
+     */
+    pub awaiting_cgi: bool,
 }
 
 impl Connection {
@@ -93,6 +103,9 @@ impl Connection {
 
             last_activity:
                 Instant::now(),
+
+            awaiting_cgi:
+                false,
         }
     }
 
