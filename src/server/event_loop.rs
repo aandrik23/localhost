@@ -56,6 +56,7 @@ use crate::server::http_handler::{
     bad_request_response,
     handle_request,
     payload_too_large_response,
+    request_timeout_response,
     RequestOutcome,
 };
 
@@ -68,6 +69,30 @@ const READ_CHUNK: usize = 16 * 1024;
 /// project's one-thread constraint.
 const SESSION_SWEEP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
+
+/// How long a client connection may go without any read or write
+/// activity before it is closed. Covers every idle-connection case
+/// the spec calls out: incomplete request headers, incomplete
+/// bodies, slow uploads, slow response consumers, and idle
+/// persistent connections. Matches CGI_TIMEOUT for consistency.
+pub const CONNECTION_IDLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// How often tick() sweeps idle connections. A shorter interval than
+/// CONNECTION_IDLE_TIMEOUT itself so an idle connection is closed
+/// reasonably close to its actual deadline, not up to a full sweep
+/// interval late.
+const CONNECTION_SWEEP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// Default hard cap on simultaneous client connections, independent
+/// of any one virtual server's configuration. Bounds memory and file
+/// descriptor usage under a connection flood; once at the cap,
+/// listener-readable events are ignored until a connection frees up.
+/// EventLoop::new uses this; EventLoop::with_max_connections allows
+/// a smaller cap, primarily so tests can exercise the cap without
+/// opening a thousand-plus real sockets.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
 pub struct EventLoop {
     epoll: Epoll,
@@ -90,6 +115,8 @@ pub struct EventLoop {
      */
     max_body_size: usize,
 
+    max_connections: usize,
+
     /*
      * Owned by the single server thread; no synchronization needed.
      * Expiration is swept from tick(), never from a background
@@ -98,6 +125,8 @@ pub struct EventLoop {
     sessions: SessionStore,
 
     last_session_sweep: std::time::Instant,
+
+    last_connection_sweep: std::time::Instant,
 
     /*
      * One entry per in-flight CGI process, keyed by its stdout fd
@@ -139,6 +168,22 @@ impl EventLoop {
     pub fn new(
         listeners: Vec<Listener>,
         config: Config,
+    ) -> io::Result<Self> {
+        Self::with_max_connections(
+            listeners,
+            config,
+            DEFAULT_MAX_CONNECTIONS,
+        )
+    }
+
+    /// Same as `new`, but with an explicit connection cap instead of
+    /// DEFAULT_MAX_CONNECTIONS. Exists primarily so tests can
+    /// exercise the connection-cap behavior without opening a
+    /// thousand-plus real sockets.
+    pub fn with_max_connections(
+        listeners: Vec<Listener>,
+        config: Config,
+        max_connections: usize,
     ) -> io::Result<Self> {
         let mut epoll =
             Epoll::new()?;
@@ -182,9 +227,13 @@ impl EventLoop {
 
             max_body_size,
 
+            max_connections,
+
             sessions: SessionStore::new(),
 
             last_session_sweep: std::time::Instant::now(),
+
+            last_connection_sweep: std::time::Instant::now(),
 
             cgi_processes: HashMap::new(),
 
@@ -231,6 +280,15 @@ impl EventLoop {
 
         self.sweep_pending_reaps();
 
+        if self.last_connection_sweep.elapsed()
+            >= CONNECTION_SWEEP_INTERVAL
+        {
+            self.sweep_idle_connections();
+
+            self.last_connection_sweep =
+                std::time::Instant::now();
+        }
+
         /*
          * epoll_wait only returns when a registered fd becomes
          * ready. A CGI child that is simply slow (e.g. stuck in a
@@ -239,17 +297,23 @@ impl EventLoop {
          * never get another chance to run and the timeout could be
          * exceeded indefinitely on an otherwise idle server. The
          * same applies to a killed-but-not-yet-reapable child and
-         * sweep_pending_reaps. Cap the wait whenever either kind of
-         * CGI bookkeeping is outstanding; a 1-second cap is frequent
-         * enough relative to CGI_TIMEOUT (10s) without turning this
-         * into a busy-wait on an idle server.
+         * sweep_pending_reaps. The idle-connection sweep has the
+         * identical problem: a client that connects and sends
+         * nothing generates no epoll event at all. Cap the wait
+         * whenever any of this bookkeeping is outstanding; a
+         * 1-second cap is frequent enough relative to both
+         * CGI_TIMEOUT and CONNECTION_IDLE_TIMEOUT (10s each) without
+         * turning this into a busy-wait on an idle server.
          */
         let cgi_work_pending =
             !self.cgi_processes.is_empty()
                 || !self.pending_reap.is_empty();
 
+        let connections_pending =
+            !self.connections.is_empty();
+
         let effective_timeout_ms =
-            if cgi_work_pending
+            if (cgi_work_pending || connections_pending)
                 && (timeout_ms < 0 || timeout_ms > 1000)
             {
                 1000
@@ -378,6 +442,21 @@ impl EventLoop {
         &mut self,
         listener_id: SocketId,
     ) {
+        /*
+         * At the connection cap: leave the pending client in the
+         * OS's listen backlog rather than accepting it. epoll is
+         * level-triggered here, so the listener will keep reporting
+         * readable on subsequent ticks until either a connection
+         * frees up (accepted then) or the peer gives up waiting -
+         * this bounds memory/fd usage without needing to accept and
+         * immediately close, which would still cost one fd
+         * momentarily and one extra syscall pair per rejected
+         * client.
+         */
+        if self.connections.len() >= self.max_connections {
+            return;
+        }
+
         let (result, local_addr, local_port) = {
             let listener =
                 match self
@@ -1149,6 +1228,62 @@ impl EventLoop {
                 stdout_fd,
                 Some("CGI process timed out".to_string()),
             );
+        }
+    }
+
+    /// Closes every connection that has gone CONNECTION_IDLE_TIMEOUT
+    /// without any read or write activity. Covers incomplete request
+    /// headers, incomplete bodies, slow uploads, slow response
+    /// consumers, and idle persistent connections - the same
+    /// last_activity timestamp is touched by every read and write,
+    /// so one check covers all of these cases uniformly. Called
+    /// periodically from tick(), never blocks.
+    ///
+    /// A connection currently waiting on a CGI process is left
+    /// alone here even if idle past the timeout - that case is
+    /// already governed by CGI_TIMEOUT and sweep_cgi_timeouts, which
+    /// owns closing it out (via finish_cgi) once the CGI itself
+    /// times out, avoiding a race between two sweeps closing the
+    /// same connection two different ways.
+    fn sweep_idle_connections(&mut self) {
+        let timed_out: Vec<SocketId> = self
+            .connections
+            .iter()
+            .filter(|(_, connection)| {
+                !connection.awaiting_cgi
+                    && connection.last_activity.elapsed()
+                        >= CONNECTION_IDLE_TIMEOUT
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        for id in timed_out {
+            let has_incomplete_request = self
+                .connections
+                .get(&id)
+                .map(|connection| {
+                    !connection.read_buf.is_empty()
+                })
+                .unwrap_or(false);
+
+            if has_incomplete_request {
+                let response =
+                    request_timeout_response(&self.config);
+
+                if let Some(connection) =
+                    self.connections.get_mut(&id)
+                {
+                    connection.queue_write_and_close(
+                        response.to_bytes(),
+                    );
+                }
+
+                let _ = self
+                    .epoll
+                    .modify(id, Interest::WRITABLE);
+            } else {
+                self.remove_connection(id);
+            }
         }
     }
 

@@ -275,3 +275,30 @@ pub fn payload_too_large_response(
         }
     }
 }
+
+pub fn request_timeout_response(
+    config: &Config,
+) -> HttpResponse {
+    match config.servers.first() {
+        Some(server) => {
+            error_response(
+                server,
+                StatusCode::RequestTimeout,
+            )
+            .with_header(
+                "Connection",
+                "close",
+            )
+        }
+
+        None => {
+            default_error_response(
+                StatusCode::RequestTimeout,
+            )
+            .with_header(
+                "Connection",
+                "close",
+            )
+        }
+    }
+}
