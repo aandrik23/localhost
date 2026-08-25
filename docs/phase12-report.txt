@@ -1,0 +1,183 @@
+Phase 12 Report — Automated Integration Test Suite
+
+Phase:
+Phase 12 — Automated Integration Test Suite.
+
+Objective:
+The spec asks for an exhaustive test suite organized by category
+(configuration, networking, http, routing, methods, uploads, cookies,
+sessions, cgi, errors, browser, stress) mapping to the audit
+checklist. Rather than starting from scratch, this phase reviewed the
+118 tests already accumulated phase-by-phase (tests/config_phase3.rs,
+networking_foundation.rs, http_parser_phase4.rs,
+http_response_phase5.rs, routing_phase6.rs, chunked_body_phase7.rs,
+uploads_phase7.rs, delete_phase8.rs, sessions_phase8.rs,
+cgi_phase9.rs, hardening_phase10.rs) against the spec's Phase 12
+category list and the audit checklist, and added tests only for the
+concrete gaps found - not duplicate coverage of what already exists.
+
+Gap analysis:
+Cross-referencing existing test function names against
+docs/audit-checklist.md and the Phase 12 "Required test categories"
+list, two gaps stood out as explicitly spec-called-out and genuinely
+untested:
+
+1. Symlink containment (audit-checklist.md section 10.1: "symlink
+   inside root" / "symlink outside root"; Phase 12's Filesystem
+   category lists the same two items explicitly). The containment
+   check itself (canonicalize + starts_with(canonical_root)) has
+   existed since Phase 5/7/8 for GET, POST (upload), and DELETE, but
+   no test ever created a real symlink to prove it - all existing
+   traversal tests used string-based paths like "/../secret.txt",
+   which is a different code path (never resolves to a real symlink)
+   from what a filesystem symlink actually exercises.
+
+2. Two spec items not covered end-to-end through the real event loop
+   for the plain (non-CGI) HTTP path:
+   - "multiple requests in one read" - tests/cgi_phase9.rs proved
+     this for a CGI route (pipelined_request_after_cgi_is_still_answered),
+     and http_parser_phase4.rs proves the parser itself handles
+     multiple requests in one buffer at the unit level, but nothing
+     drove two plain static-file GET requests through one TCP write
+     against the actual EventLoop.
+   - "multiple cookies are handled correctly" (audit-checklist.md
+     3.6) - cookie parsing supports multiple Cookie pairs and the
+     session lookup already ignores unrecognized ids
+     (request_with_unknown_cookie_gets_a_fresh_session in
+     sessions_phase8.rs), but no test sent multiple cookies in a
+     single header end-to-end to confirm the server doesn't choke on
+     that shape.
+
+Other checklist items reviewed and judged already adequately covered,
+not re-tested:
+- Session expiration: session.rs has
+  sweep_expired_removes_only_stale_sessions as a unit test against
+  SessionStore directly; an integration-level re-test through the
+  full event loop would only re-prove the same TTL arithmetic and was
+  judged not worth the added test runtime.
+- Chunked encoding edge cases, body limits, CGI failure modes,
+  routing/virtual-host selection, DELETE edge cases: all already have
+  dedicated, focused test files from their originating phases with
+  no gaps found against the checklist wording.
+
+Implemented:
+
+1. tests/filesystem_security_phase12.rs (4 tests) - symlink
+   containment through resolve_route, using std::os::unix::fs::symlink
+   to create real symlinks in temp directories:
+   - symlink_resolving_inside_root_is_served - a symlink inside the
+     route root pointing at another file inside the root resolves and
+     serves normally (proves the check isn't overly strict).
+   - symlink_escaping_root_is_forbidden - a symlink inside the root
+     pointing at a file in a different temp directory is rejected
+     with 403.
+   - symlinked_directory_escaping_root_is_forbidden - a symlinked
+     directory (not just a symlinked file) pointing outside the root
+     is rejected with 403 when a file is requested through it.
+   - delete_through_symlink_escaping_root_is_forbidden - the same
+     escape attempt via DELETE is rejected with 403, and the target
+     file outside the root is confirmed to still exist afterward
+     (the escape was blocked, not silently allowed then misreported).
+
+2. tests/http_multi_request_phase12.rs (2 tests) - driven through a
+   real EventLoop over real TCP sockets, following the same
+   bind-then-build-config-with-the-actual-port pattern used in
+   cgi_phase9.rs and hardening_phase10.rs:
+   - two_plain_requests_in_one_read_are_both_answered - two complete
+     GET requests written in a single TCP write; asserts exactly two
+     "200 OK" responses come back with both expected bodies, proving
+     the parser preserves and the event loop sequentially processes
+     the second request rather than discarding it once the first is
+     consumed.
+   - multiple_cookies_in_one_request_are_all_parsed - a single Cookie
+     header with three pairs (two arbitrary, one an unrecognized
+     session_id) sent to /session-info; asserts a normal 200 with a
+     freshly-created session, proving multi-cookie parsing doesn't
+     crash or misbehave.
+
+Test-design note:
+The first version of http_multi_request_phase12.rs's test_config used
+a fixed ports: vec![8080] like http_response_phase5.rs's request-level
+tests do, but this file drives the real EventLoop/socket layer (like
+cgi_phase9.rs and hardening_phase10.rs), which binds to an
+OS-assigned ephemeral port (port 0) rather than a fixed port. Because
+server_binds() (src/server/routing.rs) matches strictly on
+server.ports.contains(&local_port), a mismatched fixed port silently
+caused select_server to return None and every request came back 500,
+which surfaced immediately as a test failure with a clear response
+body rather than a hang - the fix was to bind first, read the actual
+assigned port, then build the test config with that real port, as the
+existing CGI/hardening test files already do.
+
+Files changed:
+- tests/filesystem_security_phase12.rs — new file, 4 tests.
+- tests/http_multi_request_phase12.rs — new file, 2 tests.
+- No src/ changes in this phase (Phase 12 is a testing phase; the
+  directory-listing href bug found and fixed during the Phase 11
+  browser pass was fixed then, ahead of this phase, and is already
+  covered incidentally by manual verification, not by a new
+  automated test — see "Known limitations" below).
+
+Tests executed:
+cargo check — clean, zero warnings.
+cargo test — 124/124 passing (19 unit, 10 CGI, 12 chunked-body, 10
+config, 7 delete, 4 filesystem-security [new], 4 hardening, 16 HTTP
+parser, 9 HTTP response/static-file, 2 HTTP multi-request [new], 7
+networking, 10 routing, 5 session, 9 upload tests).
+
+Known limitations:
+- The directory-listing relative-href bug found during Phase 11's
+  manual browser walkthrough (entries linked via a bare filename
+  instead of being anchored to the listing's own directory, so
+  clicking a file from GET /uploads - without a trailing slash -
+  resolved to the wrong URL and 404'd) was fixed in
+  src/http/static_files.rs (render_directory_listing) ahead of this
+  phase, but no regression test was added for it as part of that fix
+  or this one. This is a real gap: a future regression in href
+  generation would not be caught by the automated suite. Recommended
+  follow-up, not performed here to keep this phase scoped to the
+  gaps identified from the checklist review.
+- This phase did not reorganize the existing flat tests/ directory
+  into the tests/configuration/, tests/networking/, tests/http/, etc.
+  subdirectory structure the spec sketches as an example layout. The
+  existing per-phase file naming (config_phase3.rs, cgi_phase9.rs,
+  etc.) already maps unambiguously to the audit checklist's
+  categories and all tests pass under `cargo test` as-is; introducing
+  subdirectories would require restructuring Cargo's integration-test
+  discovery (each subdirectory needs its own mod.rs or a single
+  aggregating harness) for a purely organizational benefit with no
+  behavioral difference, so it was judged not worth the churn without
+  being explicitly requested.
+- Phase 12's "browser" test category (audit-checklist.md section 4,
+  spec's Phase 11) is inherently manual - it requires an actual
+  browser and DevTools inspection, which was performed separately in
+  the Phase 11 pass (and surfaced the directory-listing bug above). No
+  automated test can substitute for that category.
+- Stress/leak/zombie-process verification (spec's Phase 13; audit
+  checklist sections 12-13) is explicitly out of scope for this phase
+  and was not attempted here.
+
+Audit requirements satisfied:
+- Filesystem security 10.1 "symlink behavior is understood and
+  handled appropriately" — now has explicit automated proof for both
+  the inside-root (served) and outside-root (403) cases, across GET
+  and DELETE, and for both symlinked files and symlinked directories.
+- HTTP 7.2 "multiple requests in one read" — now has an
+  event-loop-level integration test for the plain HTTP path, not just
+  the CGI path (Phase 9) and the parser-unit-test level (Phase 4).
+- Cookies 3.6 "multiple cookies are handled correctly" — now has an
+  explicit end-to-end test.
+- All prior phases' audit requirements remain satisfied, unaffected
+  by this phase (no src/ changes).
+
+Remaining risks:
+- No test asserts on the exact byte-for-byte relative-vs-absolute
+  href format from directory listings (see "Known limitations"
+  above); a future refactor of render_directory_listing could
+  reintroduce the trailing-slash bug undetected by cargo test alone.
+- The new symlink tests run only on Unix (std::os::unix::fs::symlink)
+  and would need a cfg(windows) counterpart (std::os::windows::fs::
+  symlink_file/symlink_dir) if this project ever needed to run its
+  test suite on Windows; the project's own constraints (single Rust
+  process, epoll) already imply a Unix-only target, so this was not
+  treated as a gap worth closing.

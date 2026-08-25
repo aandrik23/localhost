@@ -857,11 +857,12 @@ fn render_directory_listing(
     let mut list_items = String::new();
 
     for name in &entries {
-        let href = html_escape(name);
+        let href = html_escape(&format!("{}{}", display_path, name));
+        let label = html_escape(name);
 
         list_items.push_str(&format!(
-            "<li><a href=\"{0}\">{0}</a></li>",
-            href
+            "<li><a href=\"{0}\">{1}</a></li>",
+            href, label
         ));
     }
 
