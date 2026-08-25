@@ -48,6 +48,27 @@ untested:
      single header end-to-end to confirm the server doesn't choke on
      that shape.
 
+3. A real bug found while writing the malformed-request demo command
+   for READMEFIRST.md, not from the checklist review itself: sending
+   a genuinely malformed request line (e.g. "GARBAGE REQUEST\r\n\r\n",
+   which is missing the HTTP-version component) over a real socket
+   caused the connection to hang with zero bytes sent until the
+   Phase 10 idle timeout closed it - not the immediate 400 the code
+   was clearly written to send. Root cause: event_loop.rs's
+   parse-failure branch called connection.queue_write_and_close(bytes)
+   directly, which buffers the response and marks the connection
+   Closing, but never calls self.epoll.modify(id, Interest::WRITABLE)
+   the way queue_response() does for every other response path. Since
+   epoll was never told this fd had become writable-interesting, the
+   event loop never woke up to actually send the buffered 400 - it
+   just sat there until sweep_idle_connections (Phase 10) eventually
+   closed the socket with nothing sent. Every existing "malformed
+   request" test (http_parser_phase4.rs) called the parser function
+   directly and never exercised the socket/epoll layer, so this was
+   never caught. Fixed by adding the missing epoll.modify call
+   alongside queue_write_and_close in event_loop.rs, matching the
+   established pattern.
+
 Other checklist items reviewed and judged already adequately covered,
 not re-tested:
 - Session expiration: session.rs has
@@ -79,7 +100,7 @@ Implemented:
      file outside the root is confirmed to still exist afterward
      (the escape was blocked, not silently allowed then misreported).
 
-2. tests/http_multi_request_phase12.rs (2 tests) - driven through a
+2. tests/http_multi_request_phase12.rs (3 tests) - driven through a
    real EventLoop over real TCP sockets, following the same
    bind-then-build-config-with-the-actual-port pattern used in
    cgi_phase9.rs and hardening_phase10.rs:
@@ -94,6 +115,11 @@ Implemented:
      session_id) sent to /session-info; asserts a normal 200 with a
      freshly-created session, proving multi-cookie parsing doesn't
      crash or misbehave.
+   - malformed_request_line_gets_a_400_response_over_the_wire -
+     regression test for the epoll.modify bug found in gap #3 above;
+     sends "GARBAGE REQUEST\r\n\r\n" and asserts a 400 Bad Request
+     actually arrives over the socket (not just that the parser
+     rejects it in isolation).
 
 Test-design note:
 The first version of http_multi_request_phase12.rs's test_config used
@@ -111,19 +137,30 @@ existing CGI/hardening test files already do.
 
 Files changed:
 - tests/filesystem_security_phase12.rs — new file, 4 tests.
-- tests/http_multi_request_phase12.rs — new file, 2 tests.
-- No src/ changes in this phase (Phase 12 is a testing phase; the
-  directory-listing href bug found and fixed during the Phase 11
+- tests/http_multi_request_phase12.rs — new file, 3 tests.
+- src/server/event_loop.rs — fixed the malformed-request bug in gap
+  #3: added self.epoll.modify(id, Interest::WRITABLE) after
+  connection.queue_write_and_close(bytes) in the parse-failure
+  branch, so a queued 400/413 response is actually sent instead of
+  sitting unsent until the idle timeout closes the connection.
+- The directory-listing href bug found and fixed during the Phase 11
   browser pass was fixed then, ahead of this phase, and is already
   covered incidentally by manual verification, not by a new
-  automated test — see "Known limitations" below).
+  automated test — see "Known limitations" below.
 
 Tests executed:
 cargo check — clean, zero warnings.
-cargo test — 124/124 passing (19 unit, 10 CGI, 12 chunked-body, 10
+cargo test — 125/125 passing (19 unit, 10 CGI, 12 chunked-body, 10
 config, 7 delete, 4 filesystem-security [new], 4 hardening, 16 HTTP
-parser, 9 HTTP response/static-file, 2 HTTP multi-request [new], 7
+parser, 9 HTTP response/static-file, 3 HTTP multi-request [new], 7
 networking, 10 routing, 5 session, 9 upload tests).
+
+Manual verification of the epoll.modify fix: before the fix, sending
+a raw malformed request line ("GARBAGE REQUEST\r\n\r\n") over a
+Python socket to the running server produced zero bytes and the
+connection sat open until ~11s later when it closed with no data
+sent (Phase 10's idle sweep). After the fix, the same input returns
+"HTTP/1.1 400 Bad Request..." immediately.
 
 Known limitations:
 - The directory-listing relative-href bug found during Phase 11's
@@ -167,8 +204,16 @@ Audit requirements satisfied:
   the CGI path (Phase 9) and the parser-unit-test level (Phase 4).
 - Cookies 3.6 "multiple cookies are handled correctly" — now has an
   explicit end-to-end test.
-- All prior phases' audit requirements remain satisfied, unaffected
-  by this phase (no src/ changes).
+- Error handling section 9 "Errors do not crash the server" /
+  networking checklist 1.7 "there are no hidden blocking reads" —
+  strengthened: a malformed request no longer silently hangs a
+  connection until timeout; it now gets an immediate, correct 400/413
+  response, matching what bad_request_response/
+  payload_too_large_response were clearly written to do all along.
+- All prior phases' audit requirements remain satisfied; this phase's
+  one src/ change is a targeted bug fix (missing epoll write-interest
+  registration) uncovered by the new test coverage, not a behavior
+  change to any already-passing path.
 
 Remaining risks:
 - No test asserts on the exact byte-for-byte relative-vs-absolute

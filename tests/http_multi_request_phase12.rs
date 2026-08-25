@@ -8,6 +8,17 @@
 //! - Multiple Cookie header values / multiple cookies in one request,
 //!   which src/http/parser.rs's cookie parsing supports but no test
 //!   exercised end-to-end.
+//! - A malformed request line gets an actual 400 response over the
+//!   wire. This one caught a real bug: event_loop.rs's parse-failure
+//!   path queued the 400 response and marked the connection closing,
+//!   but never called epoll.modify to arm writable interest on the
+//!   fd (unlike queue_response, which does both) - so the response
+//!   sat in the write buffer and the client just hung until the idle
+//!   timeout closed the connection with no bytes sent. Every existing
+//!   "malformed request" test exercised the parser directly
+//!   (http_parser_phase4.rs) and never drove the full event loop, so
+//!   this never surfaced. Fixed in src/server/event_loop.rs by adding
+//!   the missing epoll.modify call alongside queue_write_and_close.
 
 use std::collections::HashMap;
 use std::io::{
@@ -204,6 +215,39 @@ fn multiple_cookies_in_one_request_are_all_parsed() {
     assert!(
         text.contains("\"session_id\""),
         "expected a session_id in the JSON body: {:?}",
+        text
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn malformed_request_line_gets_a_400_response_over_the_wire() {
+    let root = temporary_directory("malformed-request");
+
+    std::fs::write(root.join("index.html"), b"home page").unwrap();
+
+    let (mut event_loop, port) =
+        start_loop(root.to_string_lossy().to_string());
+
+    let mut stream =
+        TcpStream::connect(("127.0.0.1", port)).expect("connect");
+
+    stream.set_nonblocking(true).expect("set_nonblocking");
+
+    // Not a valid request line: only two space-separated components,
+    // no HTTP version. This must be answered with 400, not silently
+    // hang until the connection idle-times-out.
+    stream
+        .write_all(b"GARBAGE REQUEST\r\n\r\n")
+        .expect("write malformed request");
+
+    let received = read_available(&mut stream, &mut event_loop, 200);
+    let text = String::from_utf8_lossy(&received);
+
+    assert!(
+        text.starts_with("HTTP/1.1 400 Bad Request"),
+        "expected 400 Bad Request, got: {:?}",
         text
     );
 

@@ -736,6 +736,11 @@ impl EventLoop {
                                 bytes
                             );
                     }
+
+                    let _ = self.epoll.modify(
+                        id,
+                        Interest::WRITABLE,
+                    );
                 }
 
             }
