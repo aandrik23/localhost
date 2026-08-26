@@ -246,7 +246,7 @@ pub fn parse_request_head(
 /// chunked bodies.
 ///
 /// `max_body_size` bounds how large a decoded body may grow while
-/// parsing. This is a connection-level, not yet route-aware, cap: it
+/// parsing. This is a connection-level, cap: it
 /// exists purely to stop a client from making the server buffer an
 /// unbounded amount of memory before routing/config-specific limits
 /// can be checked. Callers should still re-check the final body

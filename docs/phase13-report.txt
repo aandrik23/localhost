@@ -1,0 +1,210 @@
+Phase 13 Report — Stress, Leak, and Final Audit
+
+Phase:
+Phase 13 — Stress, Leak, and Final Audit.
+
+Objective:
+Verify the server remains available under stress (siege
+availability >= 99.5%) and does not leak memory, file descriptors,
+or leave zombie CGI processes / hanging connections, using a release
+build (cargo build --release) rather than the debug binary used
+throughout earlier phases' tests, since this phase is about real
+performance/resource behavior, not correctness.
+
+Tooling:
+- siege 4.0.7, installed via `sudo apt install -y siege` (not present
+  by default; required interactive sudo, run manually by the user -
+  this session cannot supply a sudo password).
+- valgrind was considered but not installed/used: it is heavy and
+  slow, and not well-suited to a long-running, high-concurrency
+  server test (confirmed with the user before proceeding). Used
+  `lsof`/`/proc/<pid>/fd` for file-descriptor counts and `ps`/`ss`
+  for RSS memory and connection-state inspection instead - available
+  by default, lightweight enough to sample repeatedly during a
+  multi-minute run without perturbing it.
+
+Test 1 — Baseline siege benchmark (spec's literal command):
+  siege -b -c 25 -t 30S http://127.0.0.1:8080/
+  Result: 361,210 transactions, 100.00% availability, 0 failed
+  transactions, transaction_rate 12,451/s.
+
+Test 2 — Mixed realistic workload (25 concurrent, then 50, then 200):
+  A URL file (tests/../scratch urls.txt) covering every route in
+  config.toml in one siege run: static HTML/CSS/JS/image/favicon,
+  directory listing (/uploads), 404 (/does-not-exist), redirect
+  (/old), CGI (/cgi/hello.py), and sessions (/session-info) - so a
+  single siege pass exercises static-file serving, routing, CGI, and
+  session creation concurrently, not just one static page repeated.
+  - 50 concurrent, 30s: 171,278 transactions, 100.00% availability,
+    0 failed.
+  - 200 concurrent, 30s (pushing well past a "modest" concurrency
+    level, still far under DEFAULT_MAX_CONNECTIONS=1024): 170,299
+    transactions, 100.00% availability, 0 failed. longest_transaction
+    rose to 3.11s under this heavier concurrent CGI load, but no
+    request went unanswered.
+
+Test 3 — Large/repeated uploads under concurrency:
+  15 concurrent users, 20s, each repeatedly POSTing a 5MB random
+  payload to a distinct /uploads/stress_N.bin path (30 distinct
+  paths). 1,817 transactions, 100.00% availability, 0 failed.
+  Verified with `cmp` that an uploaded file's on-disk bytes were
+  byte-for-byte identical to the source payload - concurrent large
+  uploads did not corrupt file contents under load.
+
+Test 4 — Malformed/hostile requests under concurrent legitimate load:
+  A Python script (scratch malformed_stress.py) opened raw sockets
+  and sent eight categories of malformed input concurrently
+  (garbage request line, bogus HTTP version, no CRLF terminator, null
+  bytes, non-numeric Content-Length, negative Content-Length,
+  malformed chunked encoding, and a ~100KB oversized request line) —
+  run from 20 threads for 15s while a simultaneous siege run (30
+  concurrent, 15s) hit the real routes.
+  Results: legitimate traffic held 100.00% availability (58,862
+  transactions, 0 failed); all 50,021 malformed-request attempts
+  received a response (0 connection errors, 0 timeouts) - the server
+  answered every single malformed request rather than hanging or
+  dropping the connection silently, confirming the epoll.modify fix
+  from Phase 12 holds under real concurrent adversarial load, not
+  just the single-connection regression test. Server log correctly
+  identified and logged the specific rejection reason for each
+  category (invalid HTTP request line / invalid Content-Length
+  header / unsupported HTTP version / HTTP headers are too large /
+  invalid chunk size) — nothing was misclassified as a crash or
+  silently swallowed.
+
+Test 5 — Long-running soak test (~2 minutes):
+  A Python script (scratch soak_traffic.py) ran 20 concurrent worker
+  threads for 120 seconds, mixing:
+  - 10 threads doing normal GETs across all configured routes;
+  - 2 threads doing repeated file uploads (50KB body, 20 distinct
+    paths, cycling - simulates "uploading" from the spec's
+    long-running test scenario list);
+  - 3 threads sending malformed requests;
+  - 5 threads doing rapid connect/disconnect cycles with no request
+    at all (pure connection churn).
+  A separate monitor sampled file-descriptor count and RSS memory
+  every 5 seconds throughout (scratch soak_monitor.sh /
+  soak_samples.txt).
+  Result: RSS was flat at 16,500 KB for the entire run (16500 KB at
+  sample 1, 16500 KB at the final sample before the last request
+  batch) - no growth over ~24 samples across 2 minutes of continuous
+  mixed load. File-descriptor count fluctuated between 6-10 (normal
+  variance from connections open at the instant of sampling) with no
+  upward trend. After the run: fds back to the idle baseline of 6,
+  0 lingering ESTABLISHED connections on port 8080, 0 zombie/defunct
+  processes, and all 20 uploaded soak files verified present with
+  correct byte content.
+
+Test 6 — Final canonical siege run:
+  siege -b -c 100 -t 30S http://127.0.0.1:8080/
+  349,974 transactions, 100.00% availability, 0 failed transactions,
+  concurrency 99.57 (siege's actual sustained concurrency, close to
+  the requested 100).
+
+Resource baseline vs. after all tests:
+  Idle baseline (before any test): 9 fds, 2,600 KB RSS.
+  After Test 1 (25c/30s, ~361K requests): 6 fds, 2,748 KB RSS.
+  After Test 6 (100c/30s, ~350K requests, on top of everything
+  before it): 6 fds, 16,896 KB RSS.
+  fds returned to baseline after every single test (never trended
+  upward across the whole session); RSS growth across the entire
+  multi-hundred-thousand-request session was ~14MB total and
+  attributable to allocator retention typical of a long-lived
+  process serving large uploads (Test 3's 5MB x 30 uploads, Test 5's
+  soak uploads), not a per-request leak - it did not continue growing
+  during the flat-RSS soak test in Test 5, which is the strongest
+  signal against a leak (a real per-connection or per-request leak
+  would have shown continuous growth across 2 minutes of sustained
+  churn, and it did not).
+
+Files changed:
+- docs/phase13-report.txt — this file.
+- No src/ changes in this phase - stress testing surfaced no new
+  bugs (the previously-fixed Phase 12 epoll.modify bug was
+  specifically re-verified under concurrent adversarial load in Test
+  4 and held).
+- Test scripts and siege URL files were written to the session
+  scratchpad directory (not the repository) since they are
+  throwaway, environment-specific stress-test drivers, not part of
+  the shipped project - re-running this phase's verification would
+  reasonably use fresh copies of similar scripts rather than
+  committed fixtures.
+
+Known limitations:
+- No dedicated memory-profiling tool (valgrind, AddressSanitizer) was
+  run, per discussion with the user - RSS-over-time flatness during a
+  2-minute, ~20-thread mixed-load soak test is used as the leak
+  signal instead. This is weaker evidence than a real leak detector
+  would provide (it would not catch a very slow leak that only shows
+  up over hours), but is consistent with the project's own
+  Known-limitations precedent in Phase 10/12 reports of using
+  practical, environment-available tooling over an unavailable ideal
+  one.
+- The soak test ran for ~2 minutes, not hours; the spec's "extended
+  period" long-running test is satisfied in spirit and scaled to what
+  is practical in this session, not literally run for hours.
+- Siege's own "successful_transactions" figure in these JSON outputs
+  undercounts relative to "transactions" whenever a run's URL mix
+  includes routes that return non-2xx status codes by design (404 on
+  /does-not-exist, 302 on /old, directory listing, etc.) - siege only
+  counts 2xx as "successful" in that specific field, but its
+  "availability" percentage (which is what the spec's 99.5% target
+  refers to) correctly counts any valid HTTP response, including
+  404/302/405, as available. This is a siege reporting quirk, not a
+  server issue, and was double-checked against server logs and direct
+  curl checks to confirm every category of request was, in fact,
+  correctly answered.
+- This phase did not attempt to test running the server under actual
+  file-descriptor-limit pressure (e.g. artificially lowering
+  ulimit -n below DEFAULT_MAX_CONNECTIONS to prove graceful
+  degradation at the OS fd ceiling rather than just the server's own
+  1024 cap) - Phase 10's connection_cap_is_enforced test already
+  proves the server's own cap logic works; testing the OS-imposed
+  ceiling as well was judged out of scope without being explicitly
+  requested.
+
+Audit requirements satisfied:
+- "Siege availability >= 99.5%" — met and substantially exceeded
+  (100.00% availability across every run performed, from 25 to 200
+  concurrent users, including under concurrent adversarial/malformed
+  traffic).
+- "Server remains alive" / "Server does not crash" — confirmed: the
+  same server process (PID unchanged) served all six test runs
+  without restart.
+- "Requests continue receiving valid responses" — confirmed via
+  siege's own transaction counts and via manual curl checks
+  interleaved between tests.
+- "No hanging connections" — confirmed: `ss -tn` showed 0 lingering
+  connections on the server port after every test.
+- "Memory does not continuously increase" — confirmed via the flat
+  RSS trace during the 2-minute soak test (Test 5).
+- "File descriptor count does not continuously increase" — confirmed:
+  fds returned to the same idle baseline (6) after every test, with
+  no upward trend across the full session.
+- "No zombie CGI processes" — confirmed via `ps aux | grep defunct`
+  showing none present after CGI-exercising runs (Tests 2, 4, 5, all
+  of which hit /cgi/hello.py or ran alongside CGI-bearing traffic).
+- "Connections are correctly cleaned up" — confirmed by the
+  fd-count-returns-to-baseline result combined with 0 lingering
+  ESTABLISHED connections after every test.
+- "Uploaded files are not corrupted" under concurrent stress (methods
+  checklist 3.5, re-verified here under load rather than only in
+  Phase 7's single-request tests) — confirmed via byte-for-byte cmp
+  of a stress-uploaded file against its source in Test 3.
+
+Remaining risks:
+- The ~14MB RSS growth observed across the full multi-hundred-
+  thousand-request session (2,600 KB idle -> 16,896 KB after Tests
+  1-6 combined) was not root-caused byte-for-byte; it is judged
+  allocator/buffer retention rather than a leak based on the flat
+  trace during Test 5's dedicated 2-minute soak, but a rigorous
+  valgrind/ASan pass would give higher confidence, particularly for
+  slow leaks that would only manifest over a multi-hour run.
+- Stress testing in this phase used 127.0.0.1 (loopback) exclusively;
+  behavior under real network conditions (latency, packet loss,
+  actual concurrent remote clients rather than one machine generating
+  all load) was not exercised and could reveal different edge cases
+  (e.g. TCP-level partial reads/writes under real latency, which the
+  loopback interface rarely produces in practice even though the
+  server's I/O code path does not distinguish loopback from remote
+  traffic).

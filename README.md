@@ -4,6 +4,21 @@ A single-threaded, non-blocking (epoll-based) HTTP/1.1 server written
 in Rust. This file gets you from zero to a running, demonstrable
 server.
 
+
+### What is epoll?
+
+epoll is a Linux kernel API for monitoring many file descriptors at once and telling you which ones are ready for I/O (readable/writable), without checking each one yourself. It's how a single thread can watch thousands of sockets efficiently instead of looping over them or blocking on each one individually.
+
+How we use it here:
+
+* One epoll instance is created at startup (event_loop.rs), so every listening socket and every client connection's fd gets registered with it.
+* The main loop calls epoll_wait() once per tick. It blocks until at least one fd is ready, then returns just the list of ready fds.
+* For each ready fd: if it's a listener, accept() a new client; if it's a client, do one read() or write(), never loop until EAGAIN, per the project's "one read/write per event" rule.
+* A connection registers Interest::WRITABLE only when it actually has a response queued to send.
+* CGI pipes (stdin/stdout to the child process) are also registered with the same epoll instance, so a slow CGI script doesn't block the loop.
+
+So epoll is the single mechanism the whole server hangs off of: one thread, one epoll_wait() call per tick, driving accepts, client reads/writes, and CGI pipe I/O all through the same readiness list and never blocking on any individual socket.
+
 ## 1. Build
 
 ```bash
